@@ -1,4 +1,4 @@
-            import streamlit as st
+import streamlit as st
 import os
 from kernel import audit_credit_report, KERNEL_VERSION, NOTES_IMMUTABLE
 
