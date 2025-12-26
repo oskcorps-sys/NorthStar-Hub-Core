@@ -1,8 +1,3 @@
-"""
-NorthStar Hub — Kernel Core (NS-DK-1.0)
-Lógica de auditoría real con Gemini 1.5 Pro
-Fail-closed + Evidence Gate + Contract normalization
-"""
 from __future__ import annotations
 
 import os
@@ -16,7 +11,9 @@ from google.genai import types
 
 from manifest_manager import ManifestManager
 
-# --- CONFIGURACIÓN CANÓNICA ---
+# -----------------------------
+# CANON (DO NOT DRIFT)
+# -----------------------------
 KERNEL_VERSION = "NS-DK-1.0"
 NOTES_IMMUTABLE = "TECHNICAL_DATA_CONSISTENCY_CHECK_ONLY"
 CONFIDENCE_GATE = 0.70
@@ -33,7 +30,7 @@ def _utc_iso() -> str:
     return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 
-def _client():
+def _client() -> genai.Client:
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError("MISSING_GEMINI_API_KEY")
@@ -54,10 +51,8 @@ def _empty_payload(status="UNKNOWN", risk_level="NONE", confidence=0.0, notes_ex
 
 
 def _normalize_contract(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Force NS-DK-1.0 contract fields + allowed enums. Fail-closed."""
     try:
         payload = dict(payload or {})
-
         status = payload.get("status", "UNKNOWN")
         risk = payload.get("risk_level", "NONE")
         findings = payload.get("findings", [])
@@ -89,10 +84,6 @@ def _normalize_contract(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _evidence_gate(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Remove findings without evidence.document + evidence.page + evidence.field.
-    If status=RISK_DETECTED but none survive => UNKNOWN.
-    """
     findings = payload.get("findings", [])
     if not isinstance(findings, list):
         payload["findings"] = []
@@ -185,14 +176,18 @@ def audit_credit_report(file_path: str) -> Dict[str, Any]:
             ),
         )
 
-        # 4) Parse + normalize + gates
         raw = json.loads(response.text)
+
         payload = _normalize_contract(raw)
         payload = _evidence_gate(payload)
 
-        # 5) Confidence gate
         if float(payload.get("confidence", 0.0)) < CONFIDENCE_GATE:
-            return _empty_payload(status="UNKNOWN", risk_level="NONE", confidence=payload.get("confidence", 0.0), notes_extra="CONFIDENCE_GATE")
+            return _empty_payload(
+                status="UNKNOWN",
+                risk_level="NONE",
+                confidence=payload.get("confidence", 0.0),
+                notes_extra="CONFIDENCE_GATE",
+            )
 
         return payload
 
