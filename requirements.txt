@@ -1,4 +1,6 @@
 streamlit
 google-genai
-pandas
+python-dotenv
+PyPDF2
 fpdf
+pandas
