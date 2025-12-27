@@ -1,7 +1,8 @@
 import json
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List
+
 
 class ManifestManager:
     """
@@ -44,10 +45,10 @@ class ManifestManager:
         folder_path: str,
         glob_pattern: str = "*.pdf",
         wait_processing: bool = True,
-        sleep_s: int = 2
+        sleep_s: int = 2,
     ) -> List[Dict[str, str]]:
         """
-        Returns a list of dicts: [{"name": "...", "uri": "...", "local": "..."}]
+        Returns list: [{"name": "...", "uri": "...", "local": "..."}]
         """
         folder = Path(folder_path)
         if not folder.exists():
@@ -62,12 +63,12 @@ class ManifestManager:
             key = self._fingerprint(p)
             entry = self.data.get(key)
 
-            # If we already have a remote reference, verify it
+            # If existing remote is active, reuse
             if entry and entry.get("name") and self._remote_active(entry["name"]):
                 refs.append({"name": entry["name"], "uri": entry["uri"], "local": p.name})
                 continue
 
-            # Upload (or re-upload)
+            # Upload / re-upload
             uploaded = self.client.files.upload(path=str(p))
 
             if wait_processing:
@@ -75,7 +76,6 @@ class ManifestManager:
                     time.sleep(sleep_s)
                     uploaded = self.client.files.get(name=uploaded.name)
 
-            # Store/overwrite manifest for this fingerprint
             self.data[key] = {
                 "name": uploaded.name,
                 "uri": uploaded.uri,
