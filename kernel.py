@@ -3,6 +3,7 @@ NorthStar Hub — Kernel Core (NS-DK-1.0)
 Scope: Technical data consistency check only
 - Evidence-bound JSON output
 - Fail-closed behavior
+- Gemini Native Files API (google-genai)
 """
 
 from __future__ import annotations
@@ -11,11 +12,12 @@ import os
 import json
 import time
 import datetime as dt
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 from google import genai
 from google.genai import types
 
+# Local helper (must exist in repo): manifest_manager.py
 from manifest_manager import ManifestManager
 
 # -----------------------------
@@ -32,7 +34,7 @@ CONFIDENCE_GATE = 0.70
 # -----------------------------
 # PATHS (Repo-local for Alpha)
 # -----------------------------
-SOUL_DIR = "00_NORTHSTAR_SOUL_IMPUT"          # folder lives in repo
+SOUL_DIR = "00_NORTHSTAR_SOUL_IMPUT"          # folder in repo (PDF standards)
 MANIFEST_PATH = "manifests/soul_manifest.json"
 TMP_DIR = "tmp"
 
@@ -43,6 +45,50 @@ MODEL_ID = "gemini-1.5-pro"
 GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
 
 
+# -----------------------------
+# SYSTEM INSTRUCTION (HARD-LOCK)
+# -----------------------------
+SYSTEM_INSTRUCTION = f"""
+ROLE: Principal Technical Data Consistency Auditor (NorthStar Hub).
+SCOPE: {NOTES_IMMUTABLE}. Not legal advice. Not financial advice. Not credit repair.
+MISSION: Detect ONLY technical inconsistencies/mismatches between the credit report PDF and provided SOUL standards PDFs.
+
+HARD RULES:
+1) OUTPUT ONLY valid JSON following NS-DK-1.0 contract. No extra text.
+2) NO recommendations, NO action steps, NO dispute letters, NO lender suggestions, NO "what to do".
+3) EVERY finding MUST include evidence: document + page + field (all required).
+4) If evidence is missing/ambiguous => DO NOT output the finding.
+5) If report is unreadable/scan/OCR weak OR key pages missing => status INCOMPLETE.
+6) If unsure => status UNKNOWN (fail-closed).
+7) User narrative is NOT evidence. Only the PDFs.
+
+NS-DK-1.0 JSON CONTRACT:
+{{
+  "version": "{KERNEL_VERSION}",
+  "timestamp": "ISO-UTC",
+  "status": "OK|RISK_DETECTED|INCOMPLETE|UNKNOWN|SCOPE_LIMITATION",
+  "risk_level": "NONE|LOW|MEDIUM|HIGH",
+  "findings": [
+    {{
+      "type": "STRING_ENUM",
+      "description": "short, technical",
+      "evidence": {{"document": "PDF_NAME", "page": 1, "field": "FIELD_NAME"}}
+    }}
+  ],
+  "confidence": 0.0,
+  "notes": "{NOTES_IMMUTABLE}"
+}}
+
+OUTPUT REQUIREMENTS:
+- If no inconsistencies found => status OK, risk_level NONE, findings [].
+- If file unreadable or missing key pages => status INCOMPLETE.
+- If unsure => status UNKNOWN (fail-closed).
+""".strip()
+
+
+# -----------------------------
+# UTILITIES
+# -----------------------------
 def _utc_iso() -> str:
     return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
@@ -65,13 +111,53 @@ def _empty_payload(
     }
 
 
-def _validate_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+def _client() -> genai.Client:
+    api_key = os.getenv(GEMINI_API_KEY_ENV)
+    if not api_key:
+        raise RuntimeError("Missing GEMINI_API_KEY environment variable.")
+    return genai.Client(api_key=api_key)
+
+
+def _files_upload_compat(client: genai.Client, file_path: str):
     """
-    Enforces NS-DK-1.0 contract + fail-closed behavior.
+    google-genai SDK has had signature differences across versions.
+    This helper tries the known variants to avoid 'unexpected keyword argument' errors.
+    """
+    # 1) Named arg: file=
+    try:
+        return client.files.upload(file=file_path)
+    except TypeError:
+        pass
+
+    # 2) Positional arg
+    try:
+        return client.files.upload(file_path)
+    except TypeError:
+        pass
+
+    # 3) Older/other variant: path=
+    # (kept as last attempt; your earlier error suggests this one may fail)
+    return client.files.upload(path=file_path)
+
+
+def _wait_until_active(client: genai.Client, f) -> Any:
+    while getattr(getattr(f, "state", None), "name", "") == "PROCESSING":
+        time.sleep(2)
+        f = client.files.get(name=f.name)
+    return f
+
+
+def _validate_payload(payload: Any) -> Dict[str, Any]:
+    """
+    Enforces NS-DK-1.0 contract and fail-closed behavior.
     Hard gate: confidence < CONFIDENCE_GATE => UNKNOWN (no conclusions).
     """
     try:
-        payload = dict(payload or {})
+        # ✅ HARD TYPE GATE
+        if not isinstance(payload, dict):
+            return _empty_payload(status="UNKNOWN", risk_level="NONE", confidence=0.0, notes_extra="BAD_JSON_SCHEMA")
+
+        payload = dict(payload)
         payload["version"] = KERNEL_VERSION
         payload["timestamp"] = payload.get("timestamp") or _utc_iso()
 
@@ -85,7 +171,10 @@ def _validate_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             payload["findings"] = []
 
         conf = payload.get("confidence")
-        payload["confidence"] = float(conf) if isinstance(conf, (int, float)) else 0.0
+        try:
+            payload["confidence"] = float(conf)
+        except Exception:
+            payload["confidence"] = 0.0
 
         # Integrity gate (Alpha)
         if payload["confidence"] < CONFIDENCE_GATE:
@@ -113,7 +202,7 @@ def _evidence_gate(payload: Dict[str, Any]) -> Dict[str, Any]:
         payload["findings"] = []
         return payload
 
-    valid = []
+    valid: List[Dict[str, Any]] = []
     for f in findings:
         if not isinstance(f, dict):
             continue
@@ -125,6 +214,7 @@ def _evidence_gate(payload: Dict[str, Any]) -> Dict[str, Any]:
         page = ev.get("page")
         field = ev.get("field")
 
+        # Must be present + not placeholder
         if doc and page and field:
             if str(page).strip().upper() != "UNKNOWN" and str(field).strip().upper() != "UNKNOWN":
                 valid.append(f)
@@ -139,93 +229,49 @@ def _evidence_gate(payload: Dict[str, Any]) -> Dict[str, Any]:
     return payload
 
 
-SYSTEM_INSTRUCTION = f"""
-ROLE: Principal Technical Data Consistency Auditor (NorthStar Hub).
-SCOPE: {NOTES_IMMUTABLE}. Not legal advice. Not financial advice. Not credit repair.
-MISSION: Detect technical inconsistencies and mismatches between a credit report and provided standards (SOUL docs).
-
-HARD RULES:
-1) OUTPUT ONLY valid JSON following NS-DK-1.0 contract. No extra text.
-2) NO recommendations, NO action steps, NO dispute letters, NO lender suggestions.
-3) Every finding MUST include evidence: document + page + field.
-4) If evidence is missing/ambiguous, do NOT output the finding.
-5) If report is unreadable/scan/OCR weak => status INCOMPLETE.
-6) User narrative is NOT evidence. Only the PDFs.
-
-NS-DK-1.0 JSON CONTRACT:
-{{
-  "version": "{KERNEL_VERSION}",
-  "timestamp": "ISO-UTC",
-  "status": "OK|RISK_DETECTED|INCOMPLETE|UNKNOWN|SCOPE_LIMITATION",
-  "risk_level": "NONE|LOW|MEDIUM|HIGH",
-  "findings": [
-    {{
-      "type": "STRING_ENUM",
-      "description": "short, technical",
-      "evidence": {{"document": "PDF_NAME", "page": 1, "field": "FIELD_NAME"}}
-    }}
-  ],
-  "confidence": 0.0,
-  "notes": "{NOTES_IMMUTABLE}"
-}}
-
-OUTPUT REQUIREMENTS:
-- If no inconsistencies found => status OK, risk_level NONE.
-- If file unreadable or missing key pages => status INCOMPLETE.
-- If unsure => status UNKNOWN (fail-closed).
-""".strip()
-
-
-def _client() -> genai.Client:
-    api_key = os.getenv(GEMINI_API_KEY_ENV)
-    if not api_key:
-        raise RuntimeError("Missing GEMINI_API_KEY environment variable.")
-    return genai.Client(api_key=api_key)
-
-
-def _upload_and_wait(client: genai.Client, file_path: str):
-    # ✅ IMPORTANT: your SDK variant rejects path=..., so we upload with file=
-    with open(file_path, "rb") as fh:
-        uploaded = client.files.upload(file=fh)
-
-    while getattr(getattr(uploaded, "state", None), "name", "") == "PROCESSING":
-        time.sleep(2)
-        uploaded = client.files.get(name=uploaded.name)
-
-    return uploaded
-
-
+# -----------------------------
+# CORE RUNNER
+# -----------------------------
 def _run_gemini_audit(report_path: str) -> Dict[str, Any]:
     client = _client()
 
-    # 1) Ensure SOUL files are active
+    # 1) Ensure SOUL folder exists
+    if not os.path.isdir(SOUL_DIR):
+        return _empty_payload(status="INCOMPLETE", risk_level="NONE", confidence=0.0, notes_extra="SOUL_DIR_MISSING")
+
+    # 2) Ensure SOUL PDFs are ACTIVE via manifest (re-upload if needed)
     mm = ManifestManager(MANIFEST_PATH, client)
-    soul_refs = mm.ensure_active_pdf_files(SOUL_DIR)
+    try:
+        soul_refs = mm.ensure_active_pdf_files(SOUL_DIR)
+    except Exception:
+        return _empty_payload(status="INCOMPLETE", risk_level="NONE", confidence=0.0, notes_extra="SOUL_MANIFEST_FAIL")
 
     if not soul_refs:
         return _empty_payload(status="INCOMPLETE", risk_level="NONE", confidence=0.0, notes_extra="SOUL_NO_PDFS_FOUND")
 
-    # 2) Upload report (STREET)
-    report_file = _upload_and_wait(client, report_path)
+    # 3) Upload report (STREET) + wait
+    report_file = _files_upload_compat(client, report_path)
+    report_file = _wait_until_active(client, report_file)
 
-    # 3) Build contents: SOUL PDFs + report PDF + instruction
-    parts = []
+    # 4) Build Parts: SOUL then REPORT then task instruction
+    parts: List[types.Part] = []
 
-    # Attach SOUL first (standards)
     for ref in soul_refs:
-        parts.append(types.Part.from_uri(file_uri=ref["uri"], mime_type="application/pdf"))
+        # ref expected: {"name": "...", "uri": "...", "local": "..."}  (uri required)
+        uri = ref.get("uri")
+        if uri:
+            parts.append(types.Part.from_uri(file_uri=uri, mime_type="application/pdf"))
 
-    # Attach report last
     parts.append(types.Part.from_uri(file_uri=report_file.uri, mime_type="application/pdf"))
 
-    # Task
     parts.append(
         types.Part.from_text(
             "Perform a technical Metro 2 consistency audit of the attached credit report against SOUL standards. "
-            "Identify technical discrepancies only. Return ONLY NS-DK-1.0 JSON."
+            "Identify ONLY technical discrepancies. Return ONLY NS-DK-1.0 JSON."
         )
     )
 
+    # 5) Execute
     resp = client.models.generate_content(
         model=MODEL_ID,
         contents=[types.Content(role="user", parts=parts)],
@@ -236,21 +282,30 @@ def _run_gemini_audit(report_path: str) -> Dict[str, Any]:
         ),
     )
 
-    # Parse JSON safely
+    # 6) Parse (fail-closed)
     try:
         raw = json.loads(resp.text)
     except Exception:
         return _empty_payload(status="UNKNOWN", risk_level="NONE", confidence=0.0, notes_extra="BAD_JSON_OUTPUT")
 
+    if not isinstance(raw, dict):
+        return _empty_payload(status="UNKNOWN", risk_level="NONE", confidence=0.0, notes_extra="BAD_JSON_SCHEMA")
+
     raw = _evidence_gate(raw)
     return _validate_payload(raw)
 
 
+# -----------------------------
+# PUBLIC API (CALLED BY STREAMLIT main.py)
+# -----------------------------
 def audit_credit_report(file_path: str) -> Dict[str, Any]:
     """
-    Canonical entry point called by Streamlit (main.py)
+    Canonical entry point called by Streamlit (main.py).
+    Input: local PDF path
+    Output: NS-DK-1.0 dict
     """
     try:
+        # Input hard gates (fail-closed)
         if not file_path or not isinstance(file_path, str):
             return _empty_payload(status="INCOMPLETE", risk_level="NONE", confidence=0.0, notes_extra="BAD_INPUT")
 
@@ -264,5 +319,7 @@ def audit_credit_report(file_path: str) -> Dict[str, Any]:
 
         return _run_gemini_audit(file_path)
 
+    except json.JSONDecodeError:
+        return _empty_payload(status="UNKNOWN", risk_level="NONE", confidence=0.0, notes_extra="BAD_JSON_OUTPUT")
     except Exception as e:
         return _empty_payload(status="UNKNOWN", risk_level="NONE", confidence=0.0, notes_extra=f"KERNEL_FAIL:{type(e).__name__}")
