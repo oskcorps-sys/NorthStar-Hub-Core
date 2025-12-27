@@ -1,5 +1,5 @@
-import streamlit as st
 import os
+import streamlit as st
 from kernel import audit_credit_report, KERNEL_VERSION, NOTES_IMMUTABLE
 
 # -----------------------------
@@ -36,7 +36,7 @@ with col1:
             with open(tmp_path, "wb") as f:
                 f.write(uploaded.getbuffer())
 
-            with st.spinner("Running forensic audit..."):
+            with st.spinner("Running technical consistency audit..."):
                 result = audit_credit_report(tmp_path)
 
             st.session_state["audit_result"] = result
@@ -51,8 +51,8 @@ with col2:
     else:
         status = res.get("status", "UNKNOWN")
         risk = res.get("risk_level", "NONE")
-        conf = float(res.get("confidence", 0.0))
-        findings = res.get("findings", [])
+        conf = float(res.get("confidence", 0.0) or 0.0)
+        findings = res.get("findings", []) or []
 
         # Headline metrics
         m1, m2, m3 = st.columns(3)
