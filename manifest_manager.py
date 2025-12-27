@@ -1,7 +1,42 @@
 import json
 import time
 from pathlib import Path
-from typing import Dict, List, Any
+from typing import Dict, List
+
+
+def _upload_any(client, file_path: str):
+    """
+    Streamlit Cloud + google-genai SDK can vary.
+    This tries multiple upload signatures until one works.
+    Returns the uploaded file object.
+    """
+    # 1) Positional (many SDKs support this)
+    try:
+        return client.files.upload(file_path)
+    except TypeError:
+        pass
+
+    # 2) Keyword path=
+    try:
+        return client.files.upload(path=file_path)
+    except TypeError:
+        pass
+
+    # 3) Keyword file= (some SDKs use this)
+    try:
+        return client.files.upload(file=file_path)
+    except TypeError:
+        pass
+
+    # 4) File handle
+    with open(file_path, "rb") as fh:
+        try:
+            return client.files.upload(file=fh)
+        except TypeError as e:
+            raise TypeError(
+                "Files.upload() signature mismatch in this environment. "
+                "Tried positional, path=, file=, and file-handle."
+            ) from e
 
 
 class ManifestManager:
@@ -12,7 +47,7 @@ class ManifestManager:
       - remote missing or not ACTIVE
     """
 
-    def __init__(self, manifest_path: str, client: Any):
+    def __init__(self, manifest_path: str, client):
         self.path = Path(manifest_path)
         self.client = client
         self.data: Dict[str, Dict] = self._load()
@@ -36,35 +71,9 @@ class ManifestManager:
     def _remote_active(self, remote_name: str) -> bool:
         try:
             f = self.client.files.get(name=remote_name)
-            return getattr(getattr(f, "state", None), "name", "") == "ACTIVE"
+            return getattr(f.state, "name", "") == "ACTIVE"
         except Exception:
             return False
-
-    def _upload_compat(self, file_path: str):
-        """
-        google-genai SDK signature compatibility:
-        tries upload(file=...), upload(positional), upload(path=...)
-        """
-        # 1) upload(file=...)
-        try:
-            return self.client.files.upload(file=file_path)
-        except TypeError:
-            pass
-
-        # 2) upload(positional)
-        try:
-            return self.client.files.upload(file_path)
-        except TypeError:
-            pass
-
-        # 3) upload(path=...) (last attempt)
-        return self.client.files.upload(path=file_path)
-
-    def _wait_processing(self, uploaded, sleep_s: int = 2):
-        while getattr(getattr(uploaded, "state", None), "name", "") == "PROCESSING":
-            time.sleep(sleep_s)
-            uploaded = self.client.files.get(name=uploaded.name)
-        return uploaded
 
     def ensure_active_pdf_files(
         self,
@@ -74,43 +83,40 @@ class ManifestManager:
         sleep_s: int = 2
     ) -> List[Dict[str, str]]:
         """
-        Returns: [{"name": "...", "uri": "...", "local": "..."}]
+        Returns list: [{"name": "...", "uri": "...", "local": "..."}]
         """
         folder = Path(folder_path)
-
-        if not folder.exists() or not folder.is_dir():
+        if not folder.exists():
             raise FileNotFoundError(f"Knowledge folder missing: {folder_path}")
 
         refs: List[Dict[str, str]] = []
 
-        pdfs = sorted([p for p in folder.glob(glob_pattern) if p.is_file()])
-        if not pdfs:
-            # No PDFs found at top-level
-            return []
+        for p in sorted(folder.glob(glob_pattern)):
+            if not p.is_file():
+                continue
 
-        for p in pdfs:
             key = self._fingerprint(p)
             entry = self.data.get(key)
 
-            # If we have remote reference, verify it
-            if entry and entry.get("name") and entry.get("uri") and self._remote_active(entry["name"]):
+            # If manifest has it and remote is ACTIVE, reuse it
+            if entry and entry.get("name") and self._remote_active(entry["name"]):
                 refs.append({"name": entry["name"], "uri": entry["uri"], "local": p.name})
                 continue
 
-            # Upload / re-upload
-            uploaded = self._upload_compat(str(p))
+            # Upload / Re-upload
+            uploaded = _upload_any(self.client, str(p))
 
             if wait_processing:
-                uploaded = self._wait_processing(uploaded, sleep_s=sleep_s)
+                while getattr(uploaded.state, "name", "") == "PROCESSING":
+                    time.sleep(sleep_s)
+                    uploaded = self.client.files.get(name=uploaded.name)
 
-            # Save manifest entry
             self.data[key] = {
                 "name": uploaded.name,
                 "uri": uploaded.uri,
                 "uploaded_at": int(time.time()),
                 "local": p.name,
             }
-
             refs.append({"name": uploaded.name, "uri": uploaded.uri, "local": p.name})
 
         self.save()
