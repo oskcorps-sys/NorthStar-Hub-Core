@@ -8,7 +8,7 @@ class ManifestManager:
     """
     Keeps a local manifest mapping local PDF fingerprints -> Gemini File name/uri.
     Re-uploads when:
-      - file changed (mtime/size)
+      - local file changed (mtime/size)
       - remote missing or not ACTIVE
     """
 
@@ -36,9 +36,21 @@ class ManifestManager:
     def _remote_active(self, remote_name: str) -> bool:
         try:
             f = self.client.files.get(name=remote_name)
-            return getattr(f.state, "name", "") == "ACTIVE"
+            return getattr(getattr(f, "state", None), "name", "") == "ACTIVE"
         except Exception:
             return False
+
+    def _upload_pdf(self, p: Path, wait_processing: bool = True, sleep_s: int = 2):
+        # ✅ IMPORTANT: Your SDK does NOT accept path=... so we upload via file=
+        with open(str(p), "rb") as fh:
+            uploaded = self.client.files.upload(file=fh)
+
+        if wait_processing:
+            while getattr(getattr(uploaded, "state", None), "name", "") == "PROCESSING":
+                time.sleep(sleep_s)
+                uploaded = self.client.files.get(name=uploaded.name)
+
+        return uploaded
 
     def ensure_active_pdf_files(
         self,
@@ -48,7 +60,8 @@ class ManifestManager:
         sleep_s: int = 2,
     ) -> List[Dict[str, str]]:
         """
-        Returns list: [{"name": "...", "uri": "...", "local": "..."}]
+        Returns list of refs:
+          [{"name": "...", "uri": "...", "local": "..."}]
         """
         folder = Path(folder_path)
         if not folder.exists():
@@ -63,19 +76,15 @@ class ManifestManager:
             key = self._fingerprint(p)
             entry = self.data.get(key)
 
-            # If existing remote is active, reuse
+            # If we already have a remote reference, verify it
             if entry and entry.get("name") and self._remote_active(entry["name"]):
                 refs.append({"name": entry["name"], "uri": entry["uri"], "local": p.name})
                 continue
 
-            # Upload / re-upload
-            uploaded = self.client.files.upload(path=str(p))
+            # Upload (or re-upload)
+            uploaded = self._upload_pdf(p, wait_processing=wait_processing, sleep_s=sleep_s)
 
-            if wait_processing:
-                while getattr(uploaded.state, "name", "") == "PROCESSING":
-                    time.sleep(sleep_s)
-                    uploaded = self.client.files.get(name=uploaded.name)
-
+            # Store/overwrite manifest for this fingerprint
             self.data[key] = {
                 "name": uploaded.name,
                 "uri": uploaded.uri,
