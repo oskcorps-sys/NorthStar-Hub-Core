@@ -1,9 +1,13 @@
-
 import os
 import streamlit as st
+
 from kernel import audit_credit_report, KERNEL_VERSION, NOTES_IMMUTABLE
 
-st.set_page_config(page_title="NorthStar Hub | Forensic Audit (Alpha)", page_icon="⚖️", layout="wide")
+st.set_page_config(
+    page_title="NorthStar Hub | Forensic Audit (Alpha)",
+    page_icon="⚖️",
+    layout="wide",
+)
 
 st.title("⚖️ NorthStar Hub (Alpha)")
 st.caption(f"Kernel: {KERNEL_VERSION} | Mode: {NOTES_IMMUTABLE}")
@@ -20,18 +24,20 @@ with col1:
         if st.button("🚀 Run Forensic Audit", use_container_width=True):
             os.makedirs("tmp", exist_ok=True)
             tmp_path = os.path.join("tmp", uploaded.name)
+
             with open(tmp_path, "wb") as f:
                 f.write(uploaded.getbuffer())
 
-            with st.spinner("Running forensic audit..."):
+            with st.spinner("Running technical consistency audit..."):
                 result = audit_credit_report(tmp_path)
 
             st.session_state["audit_result"] = result
+            st.session_state["last_file"] = uploaded.name
 
 with col2:
     st.subheader("🔍 Audit Results")
-
     res = st.session_state.get("audit_result")
+
     if not res:
         st.info("Waiting for report ingestion...")
     else:
@@ -45,7 +51,7 @@ with col2:
         m2.metric("Risk Level", risk)
         m3.metric("Confidence", f"{conf*100:.1f}%")
 
-        st.progress(conf, text=f"Confidence Gate (>= 70%). Current: {conf*100:.1f}%")
+        st.progress(conf, text=f"Confidence Gate (>=70%) — Current: {conf*100:.1f}%")
         st.divider()
 
         if findings:
@@ -57,10 +63,10 @@ with col2:
         else:
             if status == "OK":
                 st.success("No technical inconsistencies detected under current ruleset.")
-            elif status in ("INCOMPLETE", "UNKNOWN"):
-                st.warning("Insufficient evidence to reach a conclusion. No best-effort output was produced.")
+            elif status == "INCOMPLETE":
+                st.warning("Insufficient evidence (missing/unreadable sections). No conclusions produced.")
             else:
-                st.info("No findings available for this run.")
+                st.info("No evidence-bound findings produced (fail-closed).")
 
         st.divider()
         st.caption(f"Timestamp: {res.get('timestamp')} | {res.get('notes')}")
