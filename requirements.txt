@@ -1,6 +1,6 @@
 streamlit>=1.36
 google-genai>=0.6
-python-dotenv
-PyPDF2
-pandas
-fpdf
+python-dotenv>=1.0.1
+PyPDF2>=3.0.1
+pandas>=2.0.0
+fpdf>=1.7.2
