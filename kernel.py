@@ -3,6 +3,8 @@ NorthStar Hub — Kernel Core (NS-DK-1.0)
 Scope: Technical data consistency check only
 - Evidence-bound JSON output
 - Fail-closed behavior
+- SOUL manifest caching (avoid re-upload storm)
+- 429 backoff (rate-limit resilience)
 """
 
 from __future__ import annotations
@@ -10,11 +12,14 @@ from __future__ import annotations
 import os
 import json
 import time
+import hashlib
 import datetime as dt
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from google import genai
-from google.genai import types, errors  # google-genai SDK
+from google.genai import types, errors
+
 
 # -----------------------------
 # CANON (DO NOT DRIFT)
@@ -27,10 +32,16 @@ ALLOWED_RISK = {"NONE", "LOW", "MEDIUM", "HIGH"}
 
 CONFIDENCE_GATE = 0.70
 
-# Repo-local (Streamlit Cloud)
-SOUL_DIR = "00_NORTHSTAR_SOUL_IMPUT"  # (tu folder en repo)
+# -----------------------------
+# PATHS
+# -----------------------------
+SOUL_DIR = Path("00_NORTHSTAR_SOUL_IMPUT")
+MANIFEST_PATH = Path("manifests/soul_manifest.json")
+
+# -----------------------------
+# MODELS (auto-pick)
+# -----------------------------
 MODEL_PREFERRED = [
-    # Orden: primero lo ideal, luego fallback seguro
     "gemini-2.5-pro",
     "gemini-2.5-flash",
     "gemini-2.0-pro",
@@ -38,6 +49,11 @@ MODEL_PREFERRED = [
     "gemini-1.5-pro",
     "gemini-1.5-flash",
 ]
+
+# Rate-limit handling
+MAX_RETRIES = 6
+BASE_SLEEP_S = 2  # exponential backoff base
+
 
 # -----------------------------
 # UTILITIES
@@ -65,33 +81,21 @@ def _empty_payload(
 
 
 def _normalize_contract(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Normaliza a NS-DK-1.0 SIEMPRE (aunque Gemini devuelva algo raro).
-    """
     p = dict(payload or {})
     p["version"] = KERNEL_VERSION
     p["timestamp"] = p.get("timestamp") or _utc_iso()
     p["notes"] = NOTES_IMMUTABLE
 
-    status = p.get("status")
-    risk = p.get("risk_level")
+    if p.get("status") not in ALLOWED_STATUS:
+        p["status"] = "UNKNOWN"
+    if p.get("risk_level") not in ALLOWED_RISK:
+        p["risk_level"] = "NONE"
 
-    if status not in ALLOWED_STATUS:
-        status = "UNKNOWN"
-    if risk not in ALLOWED_RISK:
-        risk = "NONE"
+    if not isinstance(p.get("findings"), list):
+        p["findings"] = []
 
-    p["status"] = status
-    p["risk_level"] = risk
-
-    findings = p.get("findings")
-    if not isinstance(findings, list):
-        findings = []
-    p["findings"] = findings
-
-    conf = p.get("confidence")
     try:
-        p["confidence"] = float(conf)
+        p["confidence"] = float(p.get("confidence", 0.0))
     except Exception:
         p["confidence"] = 0.0
 
@@ -99,10 +103,6 @@ def _normalize_contract(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _evidence_gate(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Filtra findings sin evidencia mínima: document + page + field.
-    Si status=RISK_DETECTED pero no hay findings válidos => UNKNOWN (fail-closed).
-    """
     p = dict(payload or {})
     findings = p.get("findings", [])
     valid: List[Dict[str, Any]] = []
@@ -114,11 +114,9 @@ def _evidence_gate(payload: Dict[str, Any]) -> Dict[str, Any]:
             ev = f.get("evidence") or {}
             if not isinstance(ev, dict):
                 continue
-
             doc = ev.get("document")
             page = ev.get("page")
             field = ev.get("field")
-
             if doc and page and field:
                 if str(page).strip().upper() != "UNKNOWN" and str(field).strip().upper() != "UNKNOWN":
                     valid.append(f)
@@ -176,7 +174,6 @@ def _client() -> genai.Client:
     api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     if not api_key:
         raise RuntimeError("Missing GEMINI_API_KEY (or GOOGLE_API_KEY). Set it in Streamlit Secrets.")
-    # Nota: el SDK usa endpoints beta por defecto; esto es OK.
     return genai.Client(api_key=api_key)
 
 
@@ -186,7 +183,6 @@ def _list_model_names(client: genai.Client) -> List[str]:
         for m in client.models.list():
             n = getattr(m, "name", None) or getattr(m, "model", None)
             if isinstance(n, str) and n:
-                # En list() puede venir con prefijo "models/..."
                 names.append(n.replace("models/", ""))
     except Exception:
         pass
@@ -196,25 +192,53 @@ def _list_model_names(client: genai.Client) -> List[str]:
 def _pick_model(client: genai.Client) -> str:
     available = _list_model_names(client)
 
-    # 1) Preferidos (si existen)
     for m in MODEL_PREFERRED:
         if m in available:
             return m
 
-    # 2) Si list() no devolvió nada, igual intentamos el primero preferido
     if not available:
-        return MODEL_PREFERRED[0]
+        return MODEL_PREFERRED[-1]
 
-    # 3) Fallback: primer "gemini-" disponible
     for n in available:
         if n.startswith("gemini-"):
             return n
-
     return available[0]
 
 
+# -----------------------------
+# MANIFEST (SOUL CACHE)
+# -----------------------------
+def _fingerprint(path: Path) -> str:
+    st = path.stat()
+    # includes size + mtime; stable enough
+    raw = f"{path.name}::{st.st_size}::{int(st.st_mtime)}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+
+def _load_manifest() -> Dict[str, Dict[str, str]]:
+    if MANIFEST_PATH.exists():
+        try:
+            return json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_manifest(data: Dict[str, Dict[str, str]]) -> None:
+    MANIFEST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    MANIFEST_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def _remote_active(client: genai.Client, remote_name: str) -> bool:
+    try:
+        f = client.files.get(name=remote_name)
+        return getattr(getattr(f, "state", None), "name", "") == "ACTIVE"
+    except Exception:
+        return False
+
+
 def _upload_and_wait(client: genai.Client, local_path: str):
-    # IMPORTANT: SDK usa file= (no path=). :contentReference[oaicite:2]{index=2}
+    # IMPORTANT: use file=, not path=
     f = client.files.upload(file=local_path)
     while getattr(getattr(f, "state", None), "name", "") == "PROCESSING":
         time.sleep(2)
@@ -222,32 +246,87 @@ def _upload_and_wait(client: genai.Client, local_path: str):
     return f
 
 
-def _load_soul_pdfs() -> List[str]:
-    if not os.path.isdir(SOUL_DIR):
+def _ensure_soul_active(client: genai.Client) -> List[Dict[str, str]]:
+    if not SOUL_DIR.is_dir():
         return []
-    pdfs = []
-    for name in sorted(os.listdir(SOUL_DIR)):
-        if name.lower().endswith(".pdf"):
-            pdfs.append(os.path.join(SOUL_DIR, name))
-    return pdfs
+
+    manifest = _load_manifest()
+    refs: List[Dict[str, str]] = []
+
+    pdfs = sorted([p for p in SOUL_DIR.iterdir() if p.is_file() and p.name.lower().endswith(".pdf")])
+
+    for p in pdfs:
+        fp = _fingerprint(p)
+        entry = manifest.get(fp)
+
+        if entry and entry.get("name") and entry.get("uri"):
+            if _remote_active(client, entry["name"]):
+                refs.append({"name": entry["name"], "uri": entry["uri"], "local": p.name})
+                continue
+
+        # Upload (or re-upload)
+        uploaded = _upload_and_wait(client, str(p))
+        manifest[fp] = {"name": uploaded.name, "uri": uploaded.uri, "local": p.name}
+        refs.append({"name": uploaded.name, "uri": uploaded.uri, "local": p.name})
+
+    _save_manifest(manifest)
+    return refs
 
 
-def _run_gemini_audit(client: genai.Client, model_id: str, report_path: str) -> Dict[str, Any]:
-    soul_paths = _load_soul_pdfs()
-    if not soul_paths:
+# -----------------------------
+# BACKOFF HELPERS (429)
+# -----------------------------
+def _sleep_backoff(attempt: int) -> None:
+    # exponential: 2,4,8,16,... with cap
+    s = min(BASE_SLEEP_S * (2 ** attempt), 60)
+    time.sleep(s)
+
+
+def _generate_with_retries(client: genai.Client, model_id: str, content: types.Content) -> str:
+    last_err: Optional[Exception] = None
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            resp = client.models.generate_content(
+                model=model_id,
+                contents=[content],
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_INSTRUCTION,
+                    temperature=0.0,
+                    response_mime_type="application/json",
+                ),
+            )
+            return resp.text
+
+        except errors.APIError as e:
+            # 429 quota/rate limit
+            if getattr(e, "code", None) == 429:
+                last_err = e
+                _sleep_backoff(attempt)
+                continue
+            last_err = e
+            break
+
+        except Exception as e:
+            last_err = e
+            break
+
+    raise last_err or RuntimeError("MODEL_CALL_FAIL")
+
+
+# -----------------------------
+# CORE AUDIT
+# -----------------------------
+def _run_gemini_audit(client: genai.Client, report_path: str) -> Dict[str, Any]:
+    soul_refs = _ensure_soul_active(client)
+    if not soul_refs:
         return _empty_payload(status="INCOMPLETE", notes_extra="SOUL_NO_PDFS_FOUND")
-
-    # Subimos SOUL + Report
-    soul_files = []
-    for p in soul_paths:
-        soul_files.append(_upload_and_wait(client, p))
 
     report_file = _upload_and_wait(client, report_path)
 
-    # Parts: SOUL primero, luego Report, luego instrucción
     parts: List[types.Part] = []
-    for sf in soul_files:
-        parts.append(types.Part.from_uri(file_uri=sf.uri, mime_type="application/pdf"))
+    for ref in soul_refs:
+        parts.append(types.Part.from_uri(file_uri=ref["uri"], mime_type="application/pdf"))
     parts.append(types.Part.from_uri(file_uri=report_file.uri, mime_type="application/pdf"))
     parts.append(
         types.Part.from_text(
@@ -258,30 +337,32 @@ def _run_gemini_audit(client: genai.Client, model_id: str, report_path: str) -> 
         )
     )
 
+    content = types.Content(role="user", parts=parts)
+
+    # Model pick + fallback if model missing / throttled
+    model_id = _pick_model(client)
     try:
-        resp = client.models.generate_content(
-            model=model_id,
-            contents=[types.Content(role="user", parts=parts)],
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_INSTRUCTION,
-                temperature=0.0,
-                response_mime_type="application/json",
-            ),
-        )
-    except errors.APIError as e:
-        return _empty_payload(status="UNKNOWN", notes_extra=f"MODEL_CALL_FAIL:{e.code}")
-    except Exception as e:
-        return _empty_payload(status="UNKNOWN", notes_extra=f"MODEL_CALL_FAIL:{type(e).__name__}")
+        raw_text = _generate_with_retries(client, model_id, content)
+    except Exception:
+        # fallback: try a flash model if available
+        try:
+            raw_text = _generate_with_retries(client, "gemini-2.0-flash", content)
+        except Exception as e:
+            # preserve the real cause: 429, 404, etc.
+            name = type(e).__name__
+            msg = str(e)
+            if "429" in msg:
+                return _empty_payload(status="UNKNOWN", notes_extra="MODEL_CALL_FAIL:429")
+            return _empty_payload(status="UNKNOWN", notes_extra=f"MODEL_CALL_FAIL:{name}")
 
     try:
-        raw = json.loads(resp.text)
+        raw = json.loads(raw_text)
     except Exception:
         return _empty_payload(status="UNKNOWN", notes_extra="BAD_JSON_OUTPUT")
 
     payload = _normalize_contract(raw)
     payload = _evidence_gate(payload)
 
-    # Confidence gate final
     if float(payload.get("confidence", 0.0) or 0.0) < CONFIDENCE_GATE:
         return _empty_payload(
             status="UNKNOWN",
@@ -293,11 +374,10 @@ def _run_gemini_audit(client: genai.Client, model_id: str, report_path: str) -> 
 
 
 # -----------------------------
-# PUBLIC API (CALLED BY main.py)
+# PUBLIC API
 # -----------------------------
 def audit_credit_report(file_path: str) -> Dict[str, Any]:
     try:
-        # Input defense
         if not file_path or not isinstance(file_path, str):
             return _empty_payload(status="INCOMPLETE", notes_extra="BAD_INPUT")
         if not os.path.exists(file_path):
@@ -306,9 +386,8 @@ def audit_credit_report(file_path: str) -> Dict[str, Any]:
             return _empty_payload(status="INCOMPLETE", notes_extra="NOT_PDF")
 
         client = _client()
-        model_id = _pick_model(client)
-
-        return _run_gemini_audit(client, model_id, file_path)
+        return _run_gemini_audit(client, file_path)
 
     except Exception as e:
+        # last-resort fail-closed
         return _empty_payload(status="UNKNOWN", notes_extra=f"KERNEL_FAIL:{type(e).__name__}")
