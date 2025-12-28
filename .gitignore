@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.env
+manifests/*.json
+tmp/*.pdf
+.DS_Store
