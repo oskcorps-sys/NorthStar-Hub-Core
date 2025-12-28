@@ -3,5 +3,5 @@ headless = true
 enableCORS = false
 enableXsrfProtection = true
 
-[browser]
-gatherUsageStats = false
+[theme]
+base = "dark"
