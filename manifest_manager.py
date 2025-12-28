@@ -1,50 +1,68 @@
+
 import json
 import time
+import inspect
 from pathlib import Path
 from typing import Dict, List
 
 
-def _upload_any(client, file_path: str):
+def upload_any(client, file_path: str):
     """
-    Streamlit Cloud + google-genai SDK can vary.
-    This tries multiple upload signatures until one works.
-    Returns the uploaded file object.
+    Upload robusto (Streamlit Cloud-safe).
+    Se adapta a la firma real del SDK instalado.
     """
-    # 1) Positional (many SDKs support this)
-    try:
-        return client.files.upload(file_path)
-    except TypeError:
-        pass
+    fn = client.files.upload
 
-    # 2) Keyword path=
-    try:
-        return client.files.upload(path=file_path)
-    except TypeError:
-        pass
+    # wait for ACTIVE
+    def _wait(f, sleep_s=2):
+        while getattr(f.state, "name", "") == "PROCESSING":
+            time.sleep(sleep_s)
+            f = client.files.get(name=f.name)
+        return f
 
-    # 3) Keyword file= (some SDKs use this)
+    # introspect signature if possible
     try:
-        return client.files.upload(file=file_path)
-    except TypeError:
-        pass
+        sig = inspect.signature(fn)
+        params = list(sig.parameters.keys())
+    except Exception:
+        sig = None
+        params = []
 
-    # 4) File handle
-    with open(file_path, "rb") as fh:
+    # Preferred: keyword if exists
+    if "path" in params:
+        f = fn(path=file_path)
+        return _wait(f)
+
+    if "file" in params:
+        # try str
         try:
-            return client.files.upload(file=fh)
-        except TypeError as e:
-            raise TypeError(
-                "Files.upload() signature mismatch in this environment. "
-                "Tried positional, path=, file=, and file-handle."
-            ) from e
+            f = fn(file=file_path)
+            return _wait(f)
+        except TypeError:
+            pass
+        # try handle
+        with open(file_path, "rb") as fh:
+            f = fn(file=fh)
+            return _wait(f)
+
+    # Fallback: positional
+    try:
+        f = fn(file_path)
+        return _wait(f)
+    except TypeError:
+        with open(file_path, "rb") as fh:
+            f = fn(fh)
+            return _wait(f)
 
 
 class ManifestManager:
     """
-    Keeps a local manifest mapping local PDF fingerprints -> Gemini File name/uri.
-    Re-uploads when:
-      - file changed (mtime/size)
-      - remote missing or not ACTIVE
+    Local manifest:
+      fingerprint -> {name, uri, uploaded_at, local}
+
+    Re-upload when:
+      - local file changed (size/mtime)
+      - remote missing/not ACTIVE
     """
 
     def __init__(self, manifest_path: str, client):
@@ -64,9 +82,9 @@ class ManifestManager:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(self.data, indent=2), encoding="utf-8")
 
-    def _fingerprint(self, file_path: Path) -> str:
-        st = file_path.stat()
-        return f"{file_path.name}__{st.st_size}__{int(st.st_mtime)}"
+    def _fingerprint(self, p: Path) -> str:
+        st = p.stat()
+        return f"{p.name}__{st.st_size}__{int(st.st_mtime)}"
 
     def _remote_active(self, remote_name: str) -> bool:
         try:
@@ -75,41 +93,27 @@ class ManifestManager:
         except Exception:
             return False
 
-    def ensure_active_pdf_files(
-        self,
-        folder_path: str,
-        glob_pattern: str = "*.pdf",
-        wait_processing: bool = True,
-        sleep_s: int = 2
-    ) -> List[Dict[str, str]]:
-        """
-        Returns list: [{"name": "...", "uri": "...", "local": "..."}]
-        """
+    def ensure_active_pdf_files(self, folder_path: str) -> List[Dict[str, str]]:
         folder = Path(folder_path)
         if not folder.exists():
-            raise FileNotFoundError(f"Knowledge folder missing: {folder_path}")
+            raise FileNotFoundError(f"SOUL folder missing: {folder_path}")
 
         refs: List[Dict[str, str]] = []
 
-        for p in sorted(folder.glob(glob_pattern)):
+        for p in sorted(folder.glob("*.pdf")):
             if not p.is_file():
                 continue
 
             key = self._fingerprint(p)
             entry = self.data.get(key)
 
-            # If manifest has it and remote is ACTIVE, reuse it
+            # reuse if remote is ACTIVE
             if entry and entry.get("name") and self._remote_active(entry["name"]):
                 refs.append({"name": entry["name"], "uri": entry["uri"], "local": p.name})
                 continue
 
-            # Upload / Re-upload
-            uploaded = _upload_any(self.client, str(p))
-
-            if wait_processing:
-                while getattr(uploaded.state, "name", "") == "PROCESSING":
-                    time.sleep(sleep_s)
-                    uploaded = self.client.files.get(name=uploaded.name)
+            # upload/reupload
+            uploaded = upload_any(self.client, str(p))
 
             self.data[key] = {
                 "name": uploaded.name,
