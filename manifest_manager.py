@@ -1,4 +1,3 @@
-
 import json
 import time
 import inspect
@@ -13,19 +12,17 @@ def upload_any(client, file_path: str):
     """
     fn = client.files.upload
 
-    # wait for ACTIVE
     def _wait(f, sleep_s=2):
         while getattr(f.state, "name", "") == "PROCESSING":
             time.sleep(sleep_s)
             f = client.files.get(name=f.name)
         return f
 
-    # introspect signature if possible
+    # Introspect signature if possible
     try:
         sig = inspect.signature(fn)
         params = list(sig.parameters.keys())
     except Exception:
-        sig = None
         params = []
 
     # Preferred: keyword if exists
@@ -107,12 +104,12 @@ class ManifestManager:
             key = self._fingerprint(p)
             entry = self.data.get(key)
 
-            # reuse if remote is ACTIVE
+            # Reuse if remote is ACTIVE
             if entry and entry.get("name") and self._remote_active(entry["name"]):
                 refs.append({"name": entry["name"], "uri": entry["uri"], "local": p.name})
                 continue
 
-            # upload/reupload
+            # Upload/reupload (SDK-proof)
             uploaded = upload_any(self.client, str(p))
 
             self.data[key] = {
