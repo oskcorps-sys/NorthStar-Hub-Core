@@ -11,7 +11,7 @@ import os
 import json
 import time
 import datetime as dt
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from google import genai
 
@@ -37,6 +37,8 @@ MANIFEST_PATH = "manifests/soul_manifest.json"
 # -----------------------------
 # GEMINI
 # -----------------------------
+# Puedes cambiar esto por Streamlit Secrets/env si quieres:
+# MODEL_ID = os.getenv("GEMINI_MODEL_ID", "gemini-2.5-flash")
 MODEL_ID = "gemini-2.5-flash"
 GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
 
@@ -46,7 +48,7 @@ SCOPE: {NOTES_IMMUTABLE}. Not legal advice. Not financial advice. Not credit rep
 
 HARD RULES:
 1) Output ONLY valid JSON. No extra text.
-2) NO recommendations, NO action steps, NO letter generation, NO lender suggestions.
+2) NO recommendations, NO action steps, NO letters, NO lender suggestions.
 3) Every finding MUST include evidence: document + page + field.
 4) If evidence is missing/ambiguous, do NOT output the finding.
 5) If report is unreadable / scan quality weak / missing sections => status INCOMPLETE.
@@ -78,6 +80,13 @@ OUTPUT REQUIREMENTS:
 
 def _utc_iso() -> str:
     return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def _short_err(e: Exception, max_len: int = 140) -> str:
+    s = str(e).replace("\n", " ").strip()
+    if len(s) > max_len:
+        s = s[: max_len - 3] + "..."
+    return s
 
 
 def _empty_payload(
@@ -163,13 +172,22 @@ def _evidence_gate(payload: Dict[str, Any]) -> Dict[str, Any]:
 def _confidence_gate(payload: Dict[str, Any]) -> Dict[str, Any]:
     conf = float(payload.get("confidence", 0.0) or 0.0)
     if conf < CONFIDENCE_GATE:
-        return _empty_payload(status="UNKNOWN", risk_level="NONE", confidence=conf, notes_extra="CONFIDENCE_GATE_ACTIVE")
+        return _empty_payload(
+            status="UNKNOWN",
+            risk_level="NONE",
+            confidence=conf,
+            notes_extra="CONFIDENCE_GATE_ACTIVE",
+        )
     return payload
 
 
-def _call_model_with_backoff(client: genai.Client, contents: List[Any]) -> str:
+def _model_call(client: genai.Client, contents: List[Any]) -> str:
+    """
+    Llamada al modelo con backoff para 429.
+    Devuelve response.text (JSON string).
+    """
     delays = [1, 2, 4, 8]
-    last_err: Exception | None = None
+    last: Optional[Exception] = None
 
     for d in delays:
         try:
@@ -184,63 +202,68 @@ def _call_model_with_backoff(client: genai.Client, contents: List[Any]) -> str:
             )
             return resp.text
         except Exception as e:
-            last_err = e
+            last = e
             msg = str(e)
             if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
                 time.sleep(d)
                 continue
             raise
 
-    raise last_err if last_err else RuntimeError("MODEL_CALL_FAIL")
+    raise last if last else RuntimeError("MODEL_CALL_FAIL")
 
 
 def _run_gemini_audit(report_path: str) -> Dict[str, Any]:
     client = _client()
 
-    # SOUL sync
+    # 1) SOUL refs (upload + manifest)
     try:
         mm = ManifestManager(MANIFEST_PATH, client)
         soul_refs = mm.ensure_active_pdf_files(SOUL_DIR)
-    except Exception:
-        return _empty_payload(status="INCOMPLETE", notes_extra="SOUL_MANIFEST_FAIL")
+    except Exception as e:
+        return _empty_payload(status="INCOMPLETE", notes_extra=f"SOUL_MANIFEST_FAIL:{type(e).__name__}:{_short_err(e)}")
 
     if not soul_refs:
         return _empty_payload(status="INCOMPLETE", notes_extra="SOUL_EMPTY")
 
-    # Upload report (SDK-proof)
+    # 2) Upload report (robusto)
     try:
         report_file = upload_any(client, report_path)
-    except Exception:
-        return _empty_payload(status="UNKNOWN", notes_extra="REPORT_UPLOAD_FAIL")
+    except Exception as e:
+        return _empty_payload(status="UNKNOWN", notes_extra=f"REPORT_UPLOAD_FAIL:{type(e).__name__}:{_short_err(e)}")
 
-    # Contents (NO types.Part, NO from_text, NO SDK drift)
+    # 3) Build contents: [SOUL files..., report_file, instruction]
     contents: List[Any] = []
+
+    # SOUL files (como File objects)
+    for ref in soul_refs:
+        try:
+            contents.append(client.files.get(name=ref["name"]))
+        except Exception:
+            # si alguno falla, seguimos; el evidence gate + fail-closed cubre
+            continue
+
+    # Report file
+    contents.append(report_file)
+
+    # Instruction al final (más estable)
     contents.append(
         "Perform a technical Metro 2 consistency audit of the attached credit report against SOUL standards. "
         "Identify technical discrepancies only. Return ONLY NS-DK-1.0 JSON."
     )
 
-    for ref in soul_refs:
-        try:
-            contents.append(client.files.get(name=ref["name"]))
-        except Exception:
-            continue
-
-    contents.append(report_file)
-
-    # Model call
+    # 4) Call model + parse
     try:
-        text = _call_model_with_backoff(client, contents)
+        text = _model_call(client, contents)
         raw = json.loads(text)
-    except json.JSONDecodeError:
-        return _empty_payload(status="UNKNOWN", notes_extra="BAD_JSON_OUTPUT")
+    except json.JSONDecodeError as e:
+        return _empty_payload(status="UNKNOWN", notes_extra=f"BAD_JSON_OUTPUT:{type(e).__name__}")
     except Exception as e:
         msg = str(e)
         if "404" in msg or "NOT_FOUND" in msg:
-            return _empty_payload(status="UNKNOWN", notes_extra="MODEL_CALL_FAIL:404")
+            return _empty_payload(status="UNKNOWN", notes_extra=f"MODEL_CALL_FAIL:404:{_short_err(e)}")
         if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
-            return _empty_payload(status="UNKNOWN", notes_extra="MODEL_CALL_FAIL:429")
-        return _empty_payload(status="UNKNOWN", notes_extra="MODEL_CALL_FAIL")
+            return _empty_payload(status="UNKNOWN", notes_extra=f"MODEL_CALL_FAIL:429:{_short_err(e)}")
+        return _empty_payload(status="UNKNOWN", notes_extra=f"MODEL_CALL_FAIL:{type(e).__name__}:{_short_err(e)}")
 
     payload = _normalize_contract(raw)
     payload = _evidence_gate(payload)
@@ -262,4 +285,4 @@ def audit_credit_report(file_path: str) -> Dict[str, Any]:
         return _run_gemini_audit(file_path)
 
     except Exception as e:
-        return _empty_payload(status="UNKNOWN", notes_extra=f"KERNEL_FAIL:{type(e).__name__}")
+        return _empty_payload(status="UNKNOWN", notes_extra=f"KERNEL_FAIL:{type(e).__name__}:{_short_err(e)}")
