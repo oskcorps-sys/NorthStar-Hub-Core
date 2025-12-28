@@ -167,10 +167,16 @@ def audit_credit_report(file_path: str) -> Dict[str, Any]:
             parts.append(types.Part.from_uri(file_uri=ref["uri"], mime_type="application/pdf"))
 
         parts.append(types.Part.from_uri(file_uri=report_file.uri, mime_type="application/pdf"))
-        parts.append(types.Part.from_text(
-            "Perform a technical Metro 2 consistency audit of the attached credit report against SOUL standards. "
-            "Return ONLY NS-DK-1.0 JSON."
-        ))
+
+        # ✅ IMPORTANT: keyword arg for your SDK version
+        parts.append(
+            types.Part.from_text(
+                text=(
+                    "Perform a technical Metro 2 consistency audit of the attached credit report against SOUL standards. "
+                    "Return ONLY NS-DK-1.0 JSON."
+                )
+            )
+        )
 
         # STEP 4: model call
         try:
@@ -197,7 +203,11 @@ def audit_credit_report(file_path: str) -> Dict[str, Any]:
         payload = _evidence_gate(payload)
 
         if float(payload.get("confidence", 0.0)) < CONFIDENCE_GATE:
-            return _empty_payload(status="UNKNOWN", confidence=float(payload.get("confidence", 0.0)), notes_extra="CONFIDENCE_GATE")
+            return _empty_payload(
+                status="UNKNOWN",
+                confidence=float(payload.get("confidence", 0.0)),
+                notes_extra="CONFIDENCE_GATE",
+            )
 
         return payload
 
