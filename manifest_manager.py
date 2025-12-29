@@ -6,119 +6,81 @@ from typing import Dict, List
 
 
 def upload_any(client, file_path: str):
-    """
-    Upload robusto (Streamlit Cloud-safe).
-    Se adapta a la firma real del SDK instalado.
-    """
     fn = client.files.upload
 
-    def _wait(f, sleep_s=2):
+    def _wait(f):
         while getattr(f.state, "name", "") == "PROCESSING":
-            time.sleep(sleep_s)
+            time.sleep(2)
             f = client.files.get(name=f.name)
         return f
 
-    # Introspect signature if possible
     try:
         sig = inspect.signature(fn)
-        params = list(sig.parameters.keys())
+        params = sig.parameters
     except Exception:
-        params = []
+        params = {}
 
-    # Preferred: keyword if exists
     if "path" in params:
-        f = fn(path=file_path)
-        return _wait(f)
+        return _wait(fn(path=file_path))
 
     if "file" in params:
-        # try str
         try:
-            f = fn(file=file_path)
-            return _wait(f)
+            return _wait(fn(file=file_path))
         except TypeError:
-            pass
-        # try handle
-        with open(file_path, "rb") as fh:
-            f = fn(file=fh)
-            return _wait(f)
+            with open(file_path, "rb") as fh:
+                return _wait(fn(file=fh))
 
-    # Fallback: positional
-    try:
-        f = fn(file_path)
-        return _wait(f)
-    except TypeError:
-        with open(file_path, "rb") as fh:
-            f = fn(fh)
-            return _wait(f)
+    with open(file_path, "rb") as fh:
+        return _wait(fn(fh))
 
 
 class ManifestManager:
-    """
-    Local manifest:
-      fingerprint -> {name, uri, uploaded_at, local}
-
-    Re-upload when:
-      - local file changed (size/mtime)
-      - remote missing/not ACTIVE
-    """
-
     def __init__(self, manifest_path: str, client):
         self.path = Path(manifest_path)
         self.client = client
-        self.data: Dict[str, Dict] = self._load()
+        self.data = self._load()
 
-    def _load(self) -> Dict[str, Dict]:
+    def _load(self):
         if self.path.exists():
             try:
-                return json.loads(self.path.read_text(encoding="utf-8"))
+                return json.loads(self.path.read_text())
             except Exception:
-                return {}
+                pass
         return {}
 
-    def save(self) -> None:
+    def save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(self.data, indent=2), encoding="utf-8")
+        self.path.write_text(json.dumps(self.data, indent=2))
 
-    def _fingerprint(self, p: Path) -> str:
+    def _fingerprint(self, p: Path):
         st = p.stat()
         return f"{p.name}__{st.st_size}__{int(st.st_mtime)}"
 
-    def _remote_active(self, remote_name: str) -> bool:
-        try:
-            f = self.client.files.get(name=remote_name)
-            return getattr(f.state, "name", "") == "ACTIVE"
-        except Exception:
-            return False
+    def ensure_active_pdf_files(self, folder: str) -> List[Dict[str, str]]:
+        refs = []
+        base = Path(folder)
 
-    def ensure_active_pdf_files(self, folder_path: str) -> List[Dict[str, str]]:
-        folder = Path(folder_path)
-        if not folder.exists():
-            raise FileNotFoundError(f"SOUL folder missing: {folder_path}")
-
-        refs: List[Dict[str, str]] = []
-
-        for p in sorted(folder.glob("*.pdf")):
-            if not p.is_file():
-                continue
-
+        for p in sorted(base.glob("*.pdf")):
             key = self._fingerprint(p)
             entry = self.data.get(key)
 
-            # Reuse if remote is ACTIVE
-            if entry and entry.get("name") and self._remote_active(entry["name"]):
-                refs.append({"name": entry["name"], "uri": entry["uri"], "local": p.name})
-                continue
+            if entry:
+                try:
+                    f = self.client.files.get(name=entry["name"])
+                    if getattr(f.state, "name", "") == "ACTIVE":
+                        refs.append(entry)
+                        continue
+                except Exception:
+                    pass
 
-            # Upload/reupload (SDK-proof)
             uploaded = upload_any(self.client, str(p))
-
             self.data[key] = {
                 "name": uploaded.name,
                 "uri": uploaded.uri,
-                "uploaded_at": int(time.time()),
                 "local": p.name,
+                "uploaded_at": int(time.time()),
             }
-            refs.append({"name": uploaded.name, "uri": uploaded.uri, "local": p.name})
+            refs.append(self.data[key])
 
         self.save()
         return refs
