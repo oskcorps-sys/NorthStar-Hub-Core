@@ -1,25 +1,9 @@
 """
-NorthStar Hub — Kernel Core (NS-DK-1.0) + BTM Layer (v2.1)
-Scope: Technical data consistency check only
+NorthStar Hub — Kernel Core (NS-DK-1.0) — Kernel V2.2 (Cloud Hardened)
+Scope: Technical data consistency check only (fail-closed)
 - Evidence-bound JSON output
-- Fail-closed behavior (confidence gate)
-- Bureau Detection + Bureau Translation Manifest (BTM) injection
-
-Repo expectations:
-- SOUL_DIR exists in repo root (default: 00_NORTHSTAR_SOUL_IMPUT)
-- BTM JSON files live inside SOUL_DIR:
-    BTM_EXPERIAN.json
-    BTM_EQUIFAX.json
-    BTM_TRANSUNION.json
-- manifests/ folder exists (repo root) for local manifest cache (Streamlit Cloud-safe)
-
-Environment:
-- GEMINI_API_KEY must be set (Streamlit Secrets -> Environment variable)
-- Uses google-genai SDK
-
-NOTE:
-This kernel does NOT give advice, does NOT write disputes, does NOT recommend lenders.
-It only returns evidence-bound, technical inconsistency flags.
+- Confidence gate
+- Bureau Detector + BTM (Bureau Translation Manifest) auto-load
 """
 
 from __future__ import annotations
@@ -28,6 +12,7 @@ import os
 import json
 import time
 import datetime as dt
+import inspect
 from typing import Any, Dict, List, Optional
 
 from google import genai
@@ -51,33 +36,17 @@ CONFIDENCE_GATE = 0.70
 # -----------------------------
 SOUL_DIR = "00_NORTHSTAR_SOUL_IMPUT"
 MANIFEST_PATH = "manifests/soul_manifest.json"
-TMP_DIR = "tmp"
 
 # -----------------------------
 # GEMINI
 # -----------------------------
-# Use a model you confirmed works on your account (you mentioned 2.5 flash).
-# Change only here if needed.
-MODEL_ID = "gemini-2.5-flash"
+# Usa un modelo que exista en tu cuenta (ya dijiste 2.5 flash)
+MODEL_ID = os.getenv("GEMINI_MODEL_ID", "gemini-2.5-flash")
 GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
 
-# -----------------------------
-# BUREAU / BTM
-# -----------------------------
-BUREAU_EXPERIAN = "EXPERIAN"
-BUREAU_EQUIFAX = "EQUIFAX"
-BUREAU_TRANSUNION = "TRANSUNION"
-BUREAU_UNKNOWN = "UNKNOWN"
-
-BTM_FILENAME_BY_BUREAU = {
-    BUREAU_EXPERIAN: "BTM_EXPERIAN.json",
-    BUREAU_EQUIFAX: "BTM_EQUIFAX.json",
-    BUREAU_TRANSUNION: "BTM_TRANSUNION.json",
-}
-
 
 # -----------------------------
-# HELPERS
+# UTIL
 # -----------------------------
 def _utc_iso() -> str:
     return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
@@ -101,37 +70,33 @@ def _empty_payload(
     }
 
 
-def _validate_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+def _normalize_contract(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Enforces NS-DK-1.0 contract and fail-closed behavior.
-    Hard gate: confidence < 0.70 => UNKNOWN (no conclusions).
+    Normaliza output al contrato NS-DK-1.0.
+    Fail-closed: si status/risk inválidos => UNKNOWN.
     """
     try:
-        payload = dict(payload or {})
-        payload["version"] = KERNEL_VERSION
-        payload["timestamp"] = payload.get("timestamp") or _utc_iso()
+        p = dict(payload or {})
+        p["version"] = KERNEL_VERSION
+        p["timestamp"] = p.get("timestamp") or _utc_iso()
 
-        if payload.get("status") not in ALLOWED_STATUS:
-            return _empty_payload(status="UNKNOWN", risk_level="NONE", confidence=0.0, notes_extra="BAD_STATUS")
+        if p.get("status") not in ALLOWED_STATUS:
+            return _empty_payload(status="UNKNOWN", notes_extra="BAD_STATUS")
 
-        if payload.get("risk_level") not in ALLOWED_RISK:
-            return _empty_payload(status="UNKNOWN", risk_level="NONE", confidence=0.0, notes_extra="BAD_RISK_LEVEL")
+        if p.get("risk_level") not in ALLOWED_RISK:
+            return _empty_payload(status="UNKNOWN", notes_extra="BAD_RISK_LEVEL")
 
-        if not isinstance(payload.get("findings"), list):
-            payload["findings"] = []
+        if not isinstance(p.get("findings"), list):
+            p["findings"] = []
 
-        conf = payload.get("confidence")
-        payload["confidence"] = float(conf) if isinstance(conf, (int, float)) else 0.0
+        conf = p.get("confidence")
+        p["confidence"] = float(conf) if isinstance(conf, (int, float)) else 0.0
 
-        # Integrity gate (Alpha)
-        if payload["confidence"] < CONFIDENCE_GATE:
-            return _empty_payload(status="UNKNOWN", risk_level="NONE", confidence=payload["confidence"], notes_extra="CONFIDENCE_GATE")
-
-        payload["notes"] = NOTES_IMMUTABLE
-        return payload
-
+        # notes immutable
+        p["notes"] = NOTES_IMMUTABLE
+        return p
     except Exception:
-        return _empty_payload(status="UNKNOWN", risk_level="NONE", confidence=0.0, notes_extra="VALIDATION_EXCEPTION")
+        return _empty_payload(status="UNKNOWN", notes_extra="NORMALIZE_FAIL")
 
 
 def _evidence_gate(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -144,7 +109,7 @@ def _evidence_gate(payload: Dict[str, Any]) -> Dict[str, Any]:
         payload["findings"] = []
         return payload
 
-    valid: List[Dict[str, Any]] = []
+    valid = []
     for f in findings:
         if not isinstance(f, dict):
             continue
@@ -156,9 +121,7 @@ def _evidence_gate(payload: Dict[str, Any]) -> Dict[str, Any]:
         page = ev.get("page")
         field = ev.get("field")
 
-        # Require all 3
         if doc and page and field:
-            # avoid UNKNOWN placeholders
             if str(page).strip().upper() != "UNKNOWN" and str(field).strip().upper() != "UNKNOWN":
                 valid.append(f)
 
@@ -175,167 +138,135 @@ def _evidence_gate(payload: Dict[str, Any]) -> Dict[str, Any]:
 def _client() -> genai.Client:
     api_key = os.getenv(GEMINI_API_KEY_ENV)
     if not api_key:
-        raise RuntimeError("Missing GEMINI_API_KEY environment variable.")
+        raise RuntimeError("Missing GEMINI_API_KEY env var (Streamlit Secrets).")
     return genai.Client(api_key=api_key)
 
 
-def _wait_active_file(client: genai.Client, f: types.File, sleep_s: int = 2) -> types.File:
-    while getattr(getattr(f, "state", None), "name", "") == "PROCESSING":
-        time.sleep(sleep_s)
-        f = client.files.get(name=f.name)
-    return f
-
-
-def upload_any(client: genai.Client, file_path: str) -> types.File:
+def upload_any(client: genai.Client, file_path: str):
     """
-    Upload robusto (SDK-signature-safe).
-    Adapta a la firma real del SDK instalado en Streamlit Cloud.
+    Upload robusto (SDK signature drift-proof).
+    Maneja: upload(path=...), upload(file=...), upload(positional)
     """
     fn = client.files.upload
 
-    # Try keyword: path
-    try:
-        f = fn(path=file_path)  # some versions support path=
-        return _wait_active_file(client, f)
-    except TypeError:
-        pass
+    def _wait(f, sleep_s=2):
+        while getattr(getattr(f, "state", None), "name", "") == "PROCESSING":
+            time.sleep(sleep_s)
+            f = client.files.get(name=f.name)
+        return f
 
-    # Try keyword: file
+    # introspect signature
     try:
-        f = fn(file=file_path)  # some versions accept file="..."
-        return _wait_active_file(client, f)
-    except TypeError:
-        pass
+        sig = inspect.signature(fn)
+        params = list(sig.parameters.keys())
+    except Exception:
+        params = []
 
-    # Try positional: file_path
+    # keyword: path
+    if "path" in params:
+        f = fn(path=file_path)
+        return _wait(f)
+
+    # keyword: file
+    if "file" in params:
+        try:
+            f = fn(file=file_path)
+            return _wait(f)
+        except TypeError:
+            pass
+        with open(file_path, "rb") as fh:
+            f = fn(file=fh)
+            return _wait(f)
+
+    # fallback positional
     try:
         f = fn(file_path)
-        return _wait_active_file(client, f)
+        return _wait(f)
     except TypeError:
-        pass
-
-    # Try file handle
-    with open(file_path, "rb") as fh:
-        try:
-            f = fn(file=fh)
-            return _wait_active_file(client, f)
-        except TypeError:
+        with open(file_path, "rb") as fh:
             f = fn(fh)
-            return _wait_active_file(client, f)
-
-
-def _safe_read_text_from_pdf(client: genai.Client, report_file: types.File, max_chars: int = 8000) -> str:
-    """
-    Lightweight "pre-read" using Gemini: extract key header text to detect bureau.
-    Fail-closed: returns "" if anything goes wrong.
-    """
-    try:
-        sys = (
-            "You are a strict PDF header extractor.\n"
-            "Return ONLY plain text, no JSON, no commentary.\n"
-            "Extract the first-page header / bureau identifiers / report title.\n"
-            "Max output 1500 characters."
-        )
-        resp = client.models.generate_content(
-            model=MODEL_ID,
-            contents=[
-                types.Content(
-                    role="user",
-                    parts=[
-                        types.Part.from_uri(file_uri=report_file.uri, mime_type="application/pdf"),
-                        types.Part.from_text("Extract first page header text and bureau identifiers."),
-                    ],
-                )
-            ],
-            config=types.GenerateContentConfig(
-                system_instruction=sys,
-                temperature=0.0,
-            ),
-        )
-        txt = (resp.text or "").strip()
-        if len(txt) > max_chars:
-            txt = txt[:max_chars]
-        return txt
-    except Exception:
-        return ""
-
-
-def detect_bureau(client: genai.Client, report_file: types.File) -> str:
-    """
-    Detect bureau from PDF content using a cheap header extraction.
-    Falls back to UNKNOWN.
-    """
-    header = _safe_read_text_from_pdf(client, report_file)
-    h = header.upper()
-
-    # Heuristics: bureau tokens show up often in report headers
-    if "EXPERIAN" in h:
-        return BUREAU_EXPERIAN
-    if "EQUIFAX" in h:
-        return BUREAU_EQUIFAX
-    if "TRANSUNION" in h or "TRANS UNION" in h:
-        return BUREAU_TRANSUNION
-
-    # Secondary heuristic: sometimes the PDF filename is embedded
-    # (still not reliable)
-    return BUREAU_UNKNOWN
-
-
-def load_btm_json(bureau_id: str) -> Dict[str, Any]:
-    """
-    Loads BTM JSON from SOUL_DIR.
-    Returns empty dict if missing/invalid.
-    """
-    fname = BTM_FILENAME_BY_BUREAU.get(bureau_id)
-    if not fname:
-        return {}
-
-    path = os.path.join(SOUL_DIR, fname)
-    if not os.path.exists(path):
-        return {}
-
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-
-def btm_as_compact_text(btm: Dict[str, Any], bureau_id: str) -> str:
-    """
-    Converts BTM dict to compact instruction text. Keeps size bounded.
-    """
-    if not btm:
-        return f"No BTM available for {bureau_id}. Treat bureau-proprietary codes cautiously; fail-closed if unsure."
-
-    # Keep bounded: only embed essential translation tables / keys.
-    # If user created BTM files with a specific schema, we pass it as-is.
-    raw = json.dumps(btm, ensure_ascii=False)
-    if len(raw) > 12000:
-        raw = raw[:12000] + "...(truncated)"
-    return f"BTM ({bureau_id}) JSON:\n{raw}"
+            return _wait(f)
 
 
 # -----------------------------
-# SYSTEM INSTRUCTION (Kernel Soul)
+# BUREAU DETECTOR + BTM
+# -----------------------------
+BUREAU_KEYWORDS = {
+    "EXPERIAN": ["EXPERIAN"],
+    "EQUIFAX": ["EQUIFAX"],
+    "TRANSUNION": ["TRANSUNION", "TRANS UNION"],
+}
+
+BTM_FILE_BY_BUREAU = {
+    "EXPERIAN": "BTM_EXPERIAN.json",
+    "EQUIFAX": "BTM_EQUIFAX.json",
+    "TRANSUNION": "BTM_TRANSUNION.json",
+}
+
+
+def _detect_bureau_from_pdf_text(file_path: str) -> Optional[str]:
+    """
+    Ligero: intenta leer texto con PyPDF2 (si está disponible).
+    Si no hay texto (scan), devuelve None y el kernel sigue sin BTM.
+    """
+    try:
+        from PyPDF2 import PdfReader  # optional
+
+        reader = PdfReader(file_path)
+        # mira primeras 2 páginas
+        max_pages = min(2, len(reader.pages))
+        text = ""
+        for i in range(max_pages):
+            t = reader.pages[i].extract_text() or ""
+            text += " " + t
+
+        up = text.upper()
+        for bureau, keys in BUREAU_KEYWORDS.items():
+            for k in keys:
+                if k in up:
+                    return bureau
+        return None
+    except Exception:
+        return None
+
+
+def _load_btm_text(bureau: Optional[str]) -> Optional[str]:
+    if not bureau:
+        return None
+    fname = BTM_FILE_BY_BUREAU.get(bureau)
+    if not fname:
+        return None
+    path = os.path.join(SOUL_DIR, fname)
+    if not os.path.exists(path):
+        return None
+    try:
+        raw = json.loads(open(path, "r", encoding="utf-8").read())
+        # Lo metemos como texto estructurado para que Gemini lo use como diccionario
+        return json.dumps(
+            {"bureau_id": bureau, "btm": raw},
+            ensure_ascii=False,
+            indent=2,
+        )
+    except Exception:
+        return None
+
+
+# -----------------------------
+# SYSTEM INSTRUCTION (STRICT)
 # -----------------------------
 SYSTEM_INSTRUCTION = f"""
 ROLE: Principal Technical Data Consistency Auditor (NorthStar Hub).
 SCOPE: {NOTES_IMMUTABLE}. Not legal advice. Not financial advice. Not credit repair.
-MISSION: Detect technical inconsistencies and mismatches between a credit report and provided standards (SOUL docs).
+MISSION: Detect technical inconsistencies between a credit report and SOUL standards (Metro 2 + applicable references).
+BTM: If a Bureau Translation Manifest is provided, treat it as the canonical code-mapping layer for that bureau before comparing to Metro 2.
 
-HARD RULES (NON-NEGOTIABLE):
+HARD RULES:
 1) OUTPUT ONLY valid JSON following NS-DK-1.0 contract. No extra text.
-2) NO recommendations, NO action steps, NO dispute-letter writing, NO lender suggestions.
+2) NO recommendations, NO action steps, NO dispute letters, NO lender suggestions.
 3) Every finding MUST include evidence: document + page + field.
-4) If evidence is missing/ambiguous, do NOT output the finding.
-5) If report text is unreadable/scan/OCR weak => status INCOMPLETE.
-6) User narrative is NOT evidence. Only the attached documents.
-7) Bureau translation: If a BTM (Bureau Translation Manifest) is provided, use it to interpret bureau-proprietary codes.
-   - Do NOT flag "missing standard codes" if the BTM defines a valid mapping.
-   - Only flag CODE_MAPPING_INCONSISTENCY when a bureau code has no valid mapping OR contradicts the mapping.
-8) FAIL-CLOSED: If uncertain, output status UNKNOWN with NO findings.
+4) If evidence is missing/ambiguous => DO NOT output the finding.
+5) If PDF is unreadable/scan/OCR weak => status INCOMPLETE.
+6) If unsure => status UNKNOWN (fail-closed).
 
 NS-DK-1.0 JSON CONTRACT:
 {{
@@ -353,57 +284,58 @@ NS-DK-1.0 JSON CONTRACT:
   "confidence": 0.0,
   "notes": "{NOTES_IMMUTABLE}"
 }}
-
-OUTPUT REQUIREMENTS:
-- If no inconsistencies found => status OK, risk_level NONE.
-- If file unreadable or missing key pages => status INCOMPLETE.
-- If unsure => status UNKNOWN (fail-closed).
 """.strip()
 
 
 # -----------------------------
-# CORE EXECUTION
+# CORE
 # -----------------------------
 def _run_gemini_audit(report_path: str) -> Dict[str, Any]:
     client = _client()
 
-    # 1) Ensure SOUL files are active (PDFs only) via manifest manager
+    # 1) Ensure SOUL PDFs active (only PDFs go to Files API)
     mm = ManifestManager(MANIFEST_PATH, client)
-    soul_pdf_refs = mm.ensure_active_pdf_files(SOUL_DIR)  # uploads *.pdf only
+    try:
+        soul_refs = mm.ensure_active_pdf_files(SOUL_DIR)
+    except Exception as e:
+        return _empty_payload(status="INCOMPLETE", notes_extra=f"SOUL_MANIFEST_FAIL:{type(e).__name__}:{str(e)[:120]}")
 
-    if not soul_pdf_refs:
-        return _empty_payload(status="INCOMPLETE", risk_level="NONE", confidence=0.0, notes_extra="SOUL_NO_PDFS_FOUND")
+    if not soul_refs:
+        return _empty_payload(status="INCOMPLETE", notes_extra="SOUL_NO_PDFS_FOUND")
 
-    # 2) Upload report (STREET)
+    # 2) Upload report
     report_file = upload_any(client, report_path)
 
-    # 3) Detect bureau + load BTM
-    bureau_id = detect_bureau(client, report_file)
-    btm = load_btm_json(bureau_id)
-    btm_text = btm_as_compact_text(btm, bureau_id)
+    # 3) Bureau + BTM (text)
+    bureau = _detect_bureau_from_pdf_text(report_path)
+    btm_text = _load_btm_text(bureau)
 
-    # 4) Build contents: SOUL PDFs + report PDF + BTM + instruction
+    # 4) Build “evidence briefcase” parts
     parts: List[types.Part] = []
 
-    # Attach SOUL PDFs (Metro2/standards/legal references, etc.)
-    for ref in soul_pdf_refs:
+    # SOUL PDFs first (context)
+    for ref in soul_refs:
         parts.append(types.Part.from_uri(file_uri=ref["uri"], mime_type="application/pdf"))
 
-    # Attach report
+    # Report PDF (target)
     parts.append(types.Part.from_uri(file_uri=report_file.uri, mime_type="application/pdf"))
 
-    # Attach BTM as text (authority)
-    parts.append(types.Part.from_text(f"BUREAU_ID: {bureau_id}"))
-    parts.append(types.Part.from_text(btm_text))
+    # BTM as text (NOT upload)
+    if btm_text:
+        parts.append(types.Part.from_text(text=f"BTM (Bureau Translation Manifest):\n{btm_text}"))
 
-    # Final task
+    # Task instruction (keyword arg to avoid Part.from_text TypeError)
     parts.append(
         types.Part.from_text(
-            "Perform a technical consistency audit of the attached credit report against SOUL standards. "
-            "Use BTM if provided to interpret bureau codes. Return ONLY NS-DK-1.0 JSON."
+            text=(
+                "Perform a technical Metro 2 consistency audit of the attached credit report against SOUL standards. "
+                "If BTM is provided, use it to translate bureau-specific codes before judging inconsistencies. "
+                "Identify technical discrepancies only. Return ONLY NS-DK-1.0 JSON."
+            )
         )
     )
 
+    # 5) Model call
     try:
         resp = client.models.generate_content(
             model=MODEL_ID,
@@ -415,15 +347,26 @@ def _run_gemini_audit(report_path: str) -> Dict[str, Any]:
             ),
         )
     except Exception as e:
-        return _empty_payload(status="UNKNOWN", risk_level="NONE", confidence=0.0, notes_extra=f"MODEL_CALL_FAIL:{type(e).__name__}")
+        return _empty_payload(status="UNKNOWN", notes_extra=f"MODEL_CALL_FAIL:{type(e).__name__}:{str(e)[:140]}")
 
+    # 6) Parse + gates
     try:
         raw = json.loads(resp.text)
     except Exception:
-        return _empty_payload(status="UNKNOWN", risk_level="NONE", confidence=0.0, notes_extra="BAD_JSON_OUTPUT")
+        return _empty_payload(status="UNKNOWN", notes_extra="BAD_JSON_OUTPUT")
 
-    raw = _evidence_gate(raw)
-    return _validate_payload(raw)
+    payload = _normalize_contract(raw)
+    payload = _evidence_gate(payload)
+
+    # Confidence hard gate
+    if float(payload.get("confidence", 0.0) or 0.0) < CONFIDENCE_GATE:
+        return _empty_payload(
+            status="UNKNOWN",
+            confidence=float(payload.get("confidence", 0.0) or 0.0),
+            notes_extra="CONFIDENCE_GATE_ACTIVE",
+        )
+
+    return payload
 
 
 def audit_credit_report(file_path: str) -> Dict[str, Any]:
@@ -431,24 +374,21 @@ def audit_credit_report(file_path: str) -> Dict[str, Any]:
     Canonical entry point called by Streamlit (main.py)
     """
     try:
-        # Input checks
         if not file_path or not isinstance(file_path, str):
-            return _empty_payload(status="INCOMPLETE", risk_level="NONE", confidence=0.0, notes_extra="BAD_INPUT")
+            return _empty_payload(status="INCOMPLETE", notes_extra="BAD_INPUT")
 
         if not os.path.exists(file_path):
-            return _empty_payload(status="INCOMPLETE", risk_level="NONE", confidence=0.0, notes_extra="FILE_NOT_FOUND")
+            return _empty_payload(status="INCOMPLETE", notes_extra="FILE_NOT_FOUND")
 
         if not file_path.lower().endswith(".pdf"):
-            return _empty_payload(status="INCOMPLETE", risk_level="NONE", confidence=0.0, notes_extra="NOT_PDF")
-
-        # Make sure dirs exist
-        os.makedirs(TMP_DIR, exist_ok=True)
-
-        # SOUL dir must exist (repo)
-        if not os.path.isdir(SOUL_DIR):
-            return _empty_payload(status="INCOMPLETE", risk_level="NONE", confidence=0.0, notes_extra="SOUL_DIR_MISSING")
+            return _empty_payload(status="INCOMPLETE", notes_extra="NOT_PDF")
 
         return _run_gemini_audit(file_path)
 
+    except TypeError as e:
+        # IMPORTANT: include the message so you stop seeing “TypeError” only.
+        return _empty_payload(status="UNKNOWN", notes_extra=f"KERNEL_FAIL:TypeError:{str(e)[:160]}")
+    except ValueError as e:
+        return _empty_payload(status="UNKNOWN", notes_extra=f"KERNEL_FAIL:ValueError:{str(e)[:160]}")
     except Exception as e:
-        return _empty_payload(status="UNKNOWN", risk_level="NONE", confidence=0.0, notes_extra=f"KERNEL_FAIL:{type(e).__name__}")
+        return _empty_payload(status="UNKNOWN", notes_extra=f"KERNEL_FAIL:{type(e).__name__}:{str(e)[:160]}")
