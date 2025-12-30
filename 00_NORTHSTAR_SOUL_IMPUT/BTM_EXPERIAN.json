@@ -1,0 +1,17 @@
+{
+  "bureau": "EXPERIAN",
+  "version": "1.0",
+  "description": "Translation map from Experian proprietary codes to Metro 2 standard",
+  "mappings": {
+    "MOP": {
+      "01": "11",
+      "02": "12",
+      "05": "13",
+      "XB": "93"
+    },
+    "ACCOUNT_STATUS": {
+      "C": "13",
+      "D": "97"
+    }
+  }
+}
