@@ -1,0 +1,12 @@
+{
+  "bureau": "EQUIFAX",
+  "version": "1.0",
+  "description": "Translation map from Equifax proprietary codes to Metro 2 standard",
+  "mappings": {
+    "MOP": {
+      "1": "11",
+      "2": "12",
+      "5": "13"
+    }
+  }
+}
