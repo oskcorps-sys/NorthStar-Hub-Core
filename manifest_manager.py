@@ -2,50 +2,65 @@ import json
 import time
 import inspect
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
+
+try:
+    from PyPDF2 import PdfReader
+except Exception:
+    PdfReader = None
 
 
-def upload_any(client, file_path: str):
+def _pdf_page_count(path: str) -> Optional[int]:
+    if PdfReader is None:
+        return None
+    try:
+        r = PdfReader(path)
+        return len(r.pages)
+    except Exception:
+        return None
+
+
+def upload_any(client, file_path: str, sleep_s: int = 2):
     """
-    Upload robusto.
-    Se adapta a la firma real del SDK instalado:
-    - upload(path=...)
-    - upload(file=...)
-    - upload(<positional>)
+    Upload robusto (Streamlit Cloud-safe).
+    Se adapta a la firma real del SDK instalado (google-genai).
+    - Soporta: upload(path=...), upload(file=...), upload(<positional>)
+    - Espera ACTIVE (sale de PROCESSING)
     """
     fn = client.files.upload
 
-    def _wait(f, sleep_s=2):
+    def _wait(f):
         while getattr(getattr(f, "state", None), "name", "") == "PROCESSING":
             time.sleep(sleep_s)
             f = client.files.get(name=f.name)
         return f
 
-    # introspect signature if possible
+    # introspect signature
     try:
         sig = inspect.signature(fn)
         params = list(sig.parameters.keys())
     except Exception:
         params = []
 
-    # Preferred: keyword if exists
+    # Preferred keyword: path
     if "path" in params:
         f = fn(path=file_path)
         return _wait(f)
 
+    # Alternate keyword: file
     if "file" in params:
-        # try str
+        # Try passing str
         try:
             f = fn(file=file_path)
             return _wait(f)
         except TypeError:
             pass
-        # try file handle
+        # Try file handle
         with open(file_path, "rb") as fh:
             f = fn(file=fh)
             return _wait(f)
 
-    # Fallback: positional
+    # Positional fallbacks
     try:
         f = fn(file_path)
         return _wait(f)
@@ -57,15 +72,21 @@ def upload_any(client, file_path: str):
 
 class ManifestManager:
     """
-    fingerprint -> {name, uri, uploaded_at, local}
+    Local manifest:
+      fingerprint -> {name, uri, uploaded_at, local, pages}
+
     Re-upload when:
       - local file changed (size/mtime)
       - remote missing/not ACTIVE
+
+    Also:
+      - Skips PDFs above max_pages (default 1000) to avoid Gemini File limits.
     """
 
-    def __init__(self, manifest_path: str, client):
+    def __init__(self, manifest_path: str, client, max_pages: int = 1000):
         self.path = Path(manifest_path)
         self.client = client
+        self.max_pages = max_pages
         self.data: Dict[str, Dict] = self._load()
 
     def _load(self) -> Dict[str, Dict]:
@@ -102,15 +123,19 @@ class ManifestManager:
             if not p.is_file():
                 continue
 
+            pages = _pdf_page_count(str(p))
+            if pages is not None and pages > self.max_pages:
+                # Skip huge PDFs to avoid 400 INVALID_ARGUMENT (page limit)
+                continue
+
             key = self._fingerprint(p)
             entry = self.data.get(key)
 
-            # reuse if remote is ACTIVE
+            # Reuse if remote is ACTIVE
             if entry and entry.get("name") and self._remote_active(entry["name"]):
                 refs.append({"name": entry["name"], "uri": entry["uri"], "local": p.name})
                 continue
 
-            # upload/reupload
             uploaded = upload_any(self.client, str(p))
 
             self.data[key] = {
@@ -118,6 +143,7 @@ class ManifestManager:
                 "uri": uploaded.uri,
                 "uploaded_at": int(time.time()),
                 "local": p.name,
+                "pages": pages,
             }
             refs.append({"name": uploaded.name, "uri": uploaded.uri, "local": p.name})
 
