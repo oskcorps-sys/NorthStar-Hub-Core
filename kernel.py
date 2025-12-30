@@ -9,13 +9,20 @@ from __future__ import annotations
 
 import os
 import json
+import time
 import datetime as dt
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 from google import genai
 from google.genai import types
 
 from manifest_manager import ManifestManager
+
+try:
+    from PyPDF2 import PdfReader
+except Exception:
+    PdfReader = None
+
 
 # -----------------------------
 # CANON (DO NOT DRIFT)
@@ -25,19 +32,20 @@ NOTES_IMMUTABLE = "TECHNICAL_DATA_CONSISTENCY_CHECK_ONLY"
 
 ALLOWED_STATUS = {"OK", "RISK_DETECTED", "INCOMPLETE", "UNKNOWN", "SCOPE_LIMITATION"}
 ALLOWED_RISK = {"NONE", "LOW", "MEDIUM", "HIGH"}
+
 CONFIDENCE_GATE = 0.70
 
 # -----------------------------
-# PATHS
+# PATHS (Repo-local for Alpha)
 # -----------------------------
 SOUL_DIR = "00_NORTHSTAR_SOUL_IMPUT"
 MANIFEST_PATH = "manifests/soul_manifest.json"
 
 # -----------------------------
 # GEMINI
-# IMPORTANT: model names need "models/" prefix on google-genai
 # -----------------------------
-MODEL_ID = "models/gemini-2.5-flash"  # <-- your "2.5 flash"
+# Tú dijiste: "el API es 2.5 flash"
+MODEL_ID = "gemini-2.5-flash"
 GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
 
 
@@ -63,47 +71,76 @@ def _empty_payload(
     }
 
 
-def _validate_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+def _client() -> genai.Client:
+    api_key = os.getenv(GEMINI_API_KEY_ENV)
+    if not api_key:
+        raise RuntimeError("Missing GEMINI_API_KEY environment variable.")
+    return genai.Client(api_key=api_key)
+
+
+def _detect_bureau(pdf_path: str) -> str:
+    """
+    Lightweight bureau detector (no LLM).
+    Returns: 'EXPERIAN' | 'EQUIFAX' | 'TRANSUNION' | 'UNKNOWN'
+    """
+    if PdfReader is None:
+        return "UNKNOWN"
     try:
-        payload = dict(payload or {})
-        payload["version"] = KERNEL_VERSION
-        payload["timestamp"] = payload.get("timestamp") or _utc_iso()
-
-        if payload.get("status") not in ALLOWED_STATUS:
-            return _empty_payload(status="UNKNOWN", notes_extra="BAD_STATUS")
-
-        if payload.get("risk_level") not in ALLOWED_RISK:
-            return _empty_payload(status="UNKNOWN", notes_extra="BAD_RISK_LEVEL")
-
-        if not isinstance(payload.get("findings"), list):
-            payload["findings"] = []
-
-        conf = payload.get("confidence")
-        payload["confidence"] = float(conf) if isinstance(conf, (int, float)) else 0.0
-
-        # Integrity gate
-        if payload["confidence"] < CONFIDENCE_GATE:
-            return _empty_payload(
-                status="UNKNOWN",
-                risk_level="NONE",
-                confidence=payload["confidence"],
-                notes_extra="CONFIDENCE_GATE_ACTIVE",
-            )
-
-        payload["notes"] = NOTES_IMMUTABLE
-        return payload
-
+        reader = PdfReader(pdf_path)
+        if not reader.pages:
+            return "UNKNOWN"
+        text = (reader.pages[0].extract_text() or "").upper()
+        if "EXPERIAN" in text:
+            return "EXPERIAN"
+        if "EQUIFAX" in text:
+            return "EQUIFAX"
+        if "TRANSUNION" in text or "TRANS UNION" in text:
+            return "TRANSUNION"
+        return "UNKNOWN"
     except Exception:
-        return _empty_payload(status="UNKNOWN", notes_extra="VALIDATION_EXCEPTION")
+        return "UNKNOWN"
 
 
-def _evidence_gate(payload: Dict[str, Any]) -> Dict[str, Any]:
-    findings = payload.get("findings", [])
+def _coerce_int(x, default=None):
+    try:
+        return int(str(x).strip())
+    except Exception:
+        return default
+
+
+def _normalize_contract(payload: Dict[str, Any], report_path: str) -> Dict[str, Any]:
+    """
+    Kernel OWNS:
+      - version, timestamp, notes
+      - document name normalization
+      - contract shape + enum enforcement
+      - evidence gate (page+field required)
+      - fail-closed if RISK_DETECTED but no valid findings
+    """
+    out = dict(payload or {})
+    out["version"] = KERNEL_VERSION
+    out["timestamp"] = _utc_iso()
+    out["notes"] = NOTES_IMMUTABLE
+
+    # enums
+    if out.get("status") not in ALLOWED_STATUS:
+        out["status"] = "UNKNOWN"
+    if out.get("risk_level") not in ALLOWED_RISK:
+        out["risk_level"] = "NONE"
+
+    # confidence
+    try:
+        out["confidence"] = float(out.get("confidence", 0.0))
+    except Exception:
+        out["confidence"] = 0.0
+
+    # findings must be list
+    findings = out.get("findings", [])
     if not isinstance(findings, list):
-        payload["findings"] = []
-        return payload
+        findings = []
+    doc_name = os.path.basename(report_path)
 
-    valid = []
+    normalized_findings: List[Dict[str, Any]] = []
     for f in findings:
         if not isinstance(f, dict):
             continue
@@ -111,37 +148,53 @@ def _evidence_gate(payload: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(ev, dict):
             continue
 
-        doc = ev.get("document")
-        page = ev.get("page")
+        # force document
+        ev["document"] = doc_name
+
+        page = _coerce_int(ev.get("page"), default=None)
         field = ev.get("field")
 
-        if doc and page and field:
-            if str(page).strip().upper() != "UNKNOWN" and str(field).strip().upper() != "UNKNOWN":
-                valid.append(f)
+        # require page + field
+        if page is None:
+            continue
+        if not field or str(field).strip().upper() == "UNKNOWN":
+            continue
 
-    payload["findings"] = valid
+        ev["page"] = page
+        f["evidence"] = ev
 
-    # If it claims risk but can't cite evidence => fail-closed
-    if payload.get("status") == "RISK_DETECTED" and not valid:
-        payload["status"] = "UNKNOWN"
-        payload["risk_level"] = "NONE"
-        payload["confidence"] = min(float(payload.get("confidence", 0.0) or 0.0), 0.5)
+        # minimal finding fields
+        if "type" not in f or not f["type"]:
+            f["type"] = "UNKNOWN_FINDING"
+        if "description" not in f or not f["description"]:
+            f["description"] = ""
 
-    return payload
+        normalized_findings.append(f)
+
+    out["findings"] = normalized_findings
+
+    # fail-closed if claims risk but has no evidence
+    if out.get("status") == "RISK_DETECTED" and not out["findings"]:
+        out["status"] = "UNKNOWN"
+        out["risk_level"] = "NONE"
+        out["confidence"] = min(out["confidence"], 0.5)
+
+    return out
 
 
 SYSTEM_INSTRUCTION = f"""
 ROLE: Principal Technical Data Consistency Auditor (NorthStar Hub).
 SCOPE: {NOTES_IMMUTABLE}. Not legal advice. Not financial advice. Not credit repair.
-MISSION: Detect technical inconsistencies between a credit report and provided standards (SOUL docs).
+MISSION: Detect technical inconsistencies and mismatches between a credit report and SOUL standards.
 
 HARD RULES:
 1) OUTPUT ONLY valid JSON following NS-DK-1.0 contract. No extra text.
 2) NO recommendations, NO action steps, NO dispute letters, NO lender suggestions.
 3) Every finding MUST include evidence: document + page + field.
 4) If evidence is missing/ambiguous, do NOT output the finding.
-5) If PDF is unreadable/scan/OCR weak => status INCOMPLETE.
+5) If report is unreadable/scan/OCR weak => status INCOMPLETE.
 6) User narrative is NOT evidence. Only the PDFs.
+7) If bureau uses proprietary phrasing/codes, treat as "NEEDS_MAPPING" unless SOUL standards explicitly define it.
 
 NS-DK-1.0 JSON CONTRACT:
 {{
@@ -159,98 +212,119 @@ NS-DK-1.0 JSON CONTRACT:
   "confidence": 0.0,
   "notes": "{NOTES_IMMUTABLE}"
 }}
+
+OUTPUT REQUIREMENTS:
+- If no inconsistencies found => status OK, risk_level NONE.
+- If file unreadable or missing key pages => status INCOMPLETE.
+- If unsure => status UNKNOWN (fail-closed).
 """.strip()
 
 
-def _client() -> genai.Client:
-    api_key = os.getenv(GEMINI_API_KEY_ENV)
-    if not api_key:
-        raise RuntimeError("MISSING_GEMINI_API_KEY")
-    return genai.Client(api_key=api_key)
+def _upload_and_wait(client: genai.Client, local_path: str) -> Any:
+    """
+    Upload report to Gemini Files API.
+    Uses the robust uploader from ManifestManager module is separate,
+    but for the report we can do simple upload (SDK usually stable).
+    """
+    # We still need to survive signature differences:
+    # We'll try common patterns.
+    try:
+        f = client.files.upload(path=local_path)
+    except TypeError:
+        try:
+            f = client.files.upload(file=local_path)
+        except TypeError:
+            with open(local_path, "rb") as fh:
+                f = client.files.upload(file=fh)
+
+    while getattr(getattr(f, "state", None), "name", "") == "PROCESSING":
+        time.sleep(2)
+        f = client.files.get(name=f.name)
+    return f
 
 
-def _detect_bureau_from_filename(name: str) -> str:
-    n = (name or "").lower()
-    if "experian" in n:
-        return "EXPERIAN"
-    if "equifax" in n:
-        return "EQUIFAX"
-    if "transunion" in n or "trans union" in n:
-        return "TRANSUNION"
-    return "UNKNOWN"
+def _call_model_with_retries(client: genai.Client, content: types.Content, max_tries: int = 4) -> str:
+    """
+    Handles transient 429 / 5xx with exponential backoff.
+    Returns response.text (JSON string).
+    """
+    last_err = None
+    for i in range(max_tries):
+        try:
+            resp = client.models.generate_content(
+                model=MODEL_ID,
+                contents=[content],
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_INSTRUCTION,
+                    temperature=0.0,
+                    response_mime_type="application/json",
+                ),
+            )
+            return resp.text
+        except Exception as e:
+            last_err = e
+            # backoff
+            sleep_s = min(2 ** i, 10)
+            time.sleep(sleep_s)
+    raise last_err  # type: ignore
 
 
 def _run_gemini_audit(report_path: str) -> Dict[str, Any]:
     client = _client()
 
-    # 1) Ensure SOUL is active
-    try:
-        mm = ManifestManager(MANIFEST_PATH, client)
-        soul_refs = mm.ensure_active_pdf_files(SOUL_DIR)
-    except Exception as e:
-        return _empty_payload(status="INCOMPLETE", notes_extra=f"SOUL_MANIFEST_FAIL:{type(e).__name__}")
+    # Pre-read bureau for context (no separate function signature needed)
+    bureau = _detect_bureau(report_path)
 
+    # Ensure SOUL files are active (uploaded + ACTIVE)
+    mm = ManifestManager(MANIFEST_PATH, client, max_pages=1000)
+    soul_refs = mm.ensure_active_pdf_files(SOUL_DIR)
     if not soul_refs:
         return _empty_payload(status="INCOMPLETE", notes_extra="SOUL_NO_PDFS_FOUND")
 
-    # 2) Upload report (robust upload is inside ManifestManager only; report upload is SDK-stable here)
-    # For report, use the simplest call signature that google-genai>=0.6 supports: upload(file=...)
-    # If this breaks on your install, it will surface exact TypeError in notes.
-    try:
-        report_file = client.files.upload(file=report_path)
-        while getattr(getattr(report_file, "state", None), "name", "") == "PROCESSING":
-            report_file = client.files.get(name=report_file.name)
-    except TypeError as e:
-        return _empty_payload(status="UNKNOWN", notes_extra=f"UPLOAD_SIG_FAIL:{str(e)}")
-    except Exception as e:
-        return _empty_payload(status="UNKNOWN", notes_extra=f"REPORT_UPLOAD_FAIL:{type(e).__name__}")
+    # Upload report
+    report_file = _upload_and_wait(client, report_path)
 
-    # 3) Build parts: SOUL first, then report, then instruction
-    parts = []
+    # Build parts (SOUL first, then report, then instruction)
+    parts: List[types.Part] = []
+
     for ref in soul_refs:
         parts.append(types.Part.from_uri(file_uri=ref["uri"], mime_type="application/pdf"))
 
     parts.append(types.Part.from_uri(file_uri=report_file.uri, mime_type="application/pdf"))
 
-    bureau_id = _detect_bureau_from_filename(os.path.basename(report_path))
     parts.append(
         types.Part.from_text(
             text=(
-                f"BUREAU_ID={bureau_id}. "
-                "Perform a TECHNICAL Metro 2 consistency audit of the attached credit report against SOUL standards. "
-                "Return ONLY NS-DK-1.0 JSON."
+                f"BUREAU_ID={bureau}. Perform a technical consistency audit of the attached credit report against SOUL standards. "
+                f"Return ONLY NS-DK-1.0 JSON. Evidence MUST include page+field."
             )
         )
     )
 
-    # 4) Model call
-    try:
-        resp = client.models.generate_content(
-            model=MODEL_ID,
-            contents=[types.Content(role="user", parts=parts)],
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_INSTRUCTION,
-                temperature=0.0,
-                response_mime_type="application/json",
-            ),
+    content = types.Content(role="user", parts=parts)
+
+    raw_text = _call_model_with_retries(client, content)
+    raw = json.loads(raw_text)
+
+    payload = _normalize_contract(raw, report_path=report_path)
+
+    # Confidence gate (hard)
+    if float(payload.get("confidence", 0.0)) < CONFIDENCE_GATE:
+        return _empty_payload(
+            status="UNKNOWN",
+            risk_level="NONE",
+            confidence=float(payload.get("confidence", 0.0)),
+            notes_extra="CONFIDENCE_GATE_ACTIVE",
         )
-    except Exception as e:
-        # surface the real error (404/429/400)
-        return _empty_payload(status="UNKNOWN", notes_extra=f"MODEL_CALL_FAIL:{type(e).__name__}")
 
-    # 5) Parse JSON safely
-    try:
-        raw = json.loads(resp.text)
-    except Exception:
-        return _empty_payload(status="UNKNOWN", notes_extra="BAD_JSON_OUTPUT")
-
-    raw = _evidence_gate(raw)
-    return _validate_payload(raw)
+    return payload
 
 
 def audit_credit_report(file_path: str) -> Dict[str, Any]:
+    """
+    Canonical entry point called by Streamlit (main.py).
+    """
     try:
-        # Input defense
         if not file_path or not isinstance(file_path, str):
             return _empty_payload(status="INCOMPLETE", notes_extra="BAD_INPUT")
 
@@ -260,10 +334,10 @@ def audit_credit_report(file_path: str) -> Dict[str, Any]:
         if not file_path.lower().endswith(".pdf"):
             return _empty_payload(status="INCOMPLETE", notes_extra="NOT_PDF")
 
-        # Make sure folders exist
-        os.makedirs("manifests", exist_ok=True)
-
         return _run_gemini_audit(file_path)
 
+    except json.JSONDecodeError:
+        return _empty_payload(status="UNKNOWN", notes_extra="BAD_JSON_OUTPUT")
     except Exception as e:
-        return _empty_payload(status="UNKNOWN", notes_extra=f"KERNEL_FAIL:{type(e).__name__}:{str(e)}")
+        # Keep error type only (avoid leaking details on Streamlit)
+        return _empty_payload(status="UNKNOWN", notes_extra=f"KERNEL_FAIL:{type(e).__name__}")
