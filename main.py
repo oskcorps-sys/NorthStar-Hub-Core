@@ -9,6 +9,10 @@ st.set_page_config(
     layout="wide",
 )
 
+# Streamlit Cloud: map secrets -> env var (kernel reads env)
+if "GEMINI_API_KEY" in st.secrets and not os.getenv("GEMINI_API_KEY"):
+    os.environ["GEMINI_API_KEY"] = st.secrets["GEMINI_API_KEY"]
+
 st.title("⚖️ NorthStar Hub (Alpha)")
 st.caption(f"Kernel: {KERNEL_VERSION} | Mode: {NOTES_IMMUTABLE}")
 st.divider()
@@ -29,7 +33,6 @@ with col1:
                 f.write(uploaded.getbuffer())
 
             with st.spinner("Running technical consistency audit..."):
-                # ✅ FIX: kernel expects ONLY 1 argument
                 result = audit_credit_report(tmp_path)
 
             st.session_state["audit_result"] = result
