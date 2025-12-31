@@ -1,12 +1,71 @@
 {
   "bureau": "EQUIFAX",
-  "version": "1.0",
-  "description": "Translation map from Equifax proprietary codes to Metro 2 standard",
+  "version": "1.1",
+  "description": "Translation map for Equifax consumer report display codes -> canonical normalized meanings (pre-kernel). Not a judgment layer.",
+  "normalization_rules": {
+    "rate_code": {
+      "applies_to": "Equifax numeric rate codes (0-9) used in consumer display fields",
+      "note": "Normalize to canonical delinquency meaning before kernel evaluation."
+    },
+    "ecoa_whose": {
+      "applies_to": "Equifax 'Whose' / Responsibility / ECOA display codes",
+      "note": "Letters commonly used; normalize to canonical responsibility."
+    },
+    "alpha_numeric_status": {
+      "applies_to": "Metro2-like display combos (e.g., R1, I9, M1) often shown in Equifax/tri-merge views",
+      "note": "Normalize account type and status components. Do not treat combo as formatting error by itself."
+    }
+  },
   "mappings": {
-    "MOP": {
-      "1": "11",
-      "2": "12",
-      "5": "13"
+    "RATE_CODE_0_9": {
+      "0": "TOO_NEW_TO_RATE_OR_APPROVED_NOT_USED",
+      "1": "CURRENT",
+      "2": "DLQ_30",
+      "3": "DLQ_60",
+      "4": "DLQ_90",
+      "5": "DLQ_120_PLUS",
+      "7": "CH13_INCLUDED",
+      "8": "REPOSSESSION",
+      "9": "CHARGE_OFF_BAD_DEBT"
+    },
+    "ECOA_WHOSE": {
+      "I": "INDIVIDUAL",
+      "J": "JOINT",
+      "A": "AUTHORIZED_USER",
+      "M": "MAKER_PRIMARY",
+      "C": "CO_MAKER_GUARANTOR",
+      "S": "SHARED_CONTINGENT_LIABILITY",
+      "T": "TERMINATED",
+      "X": "DECEASED",
+      "U": "UNDESIGNATED"
+    },
+    "ACCOUNT_TYPE_ALPHA": {
+      "R": "REVOLVING",
+      "I": "INSTALLMENT",
+      "M": "MORTGAGE",
+      "O": "OPEN"
+    },
+    "ALPHANUMERIC_COMBO_STATUS": {
+      "1": "CURRENT",
+      "9": "CHARGE_OFF_BAD_DEBT",
+      "7": "CH13_INCLUDED",
+      "8": "REPOSSESSION"
+    },
+    "DATE_SUFFIX_INDICATORS": {
+      "R": "REPORTED_INDICATOR",
+      "A": "AUTOMATED_INDICATOR"
+    }
+  },
+  "parsing_hints": {
+    "combo_examples": [
+      "R1 => account_type=REVOLVING, status=CURRENT",
+      "I9 => account_type=INSTALLMENT, status=CHARGE_OFF_BAD_DEBT",
+      "M1 => account_type=MORTGAGE, status=CURRENT"
+    ],
+    "unknown_code_policy": {
+      "on_unknown_rate_code": "UNKNOWN_CODE",
+      "on_unknown_ecoa_code": "UNKNOWN_CODE",
+      "on_unknown_combo": "UNKNOWN_CODE"
     }
   }
 }
