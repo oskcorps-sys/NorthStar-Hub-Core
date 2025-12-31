@@ -1,17 +1,73 @@
 {
   "bureau": "EXPERIAN",
-  "version": "1.0",
-  "description": "Translation map from Experian proprietary codes to Metro 2 standard",
-  "mappings": {
-    "MOP": {
-      "01": "11",
-      "02": "12",
-      "05": "13",
-      "XB": "93"
+  "version": "1.1",
+  "description": "Translation map for Experian consumer report display codes -> canonical normalized meanings (pre-kernel). Not a judgment layer.",
+  "normalization_rules": {
+    "history_grid": {
+      "applies_to": "Experian 25-month (or similar) payment history grid",
+      "note": "These symbols are display codes. They must be normalized before kernel evaluation."
     },
-    "ACCOUNT_STATUS": {
-      "C": "13",
-      "D": "97"
+    "ecoa_responsibility": {
+      "applies_to": "Responsibility / ECOA indicators as displayed in consumer reports",
+      "note": "Experian may show letters or numbers depending on report format. Normalize both."
+    }
+  },
+  "mappings": {
+    "PAYMENT_HISTORY_GRID": {
+      "C": "CURRENT",
+      "OK": "CURRENT",
+      "N": "CURRENT_ZERO_BALANCE",
+      "-": "NO_DATA",
+      "ND": "NO_DATA",
+      "1": "DLQ_30",
+      "2": "DLQ_60",
+      "3": "DLQ_90",
+      "4": "DLQ_120",
+      "5": "DLQ_150",
+      "6": "DLQ_180",
+      "7": "CH13_WAGE_EARNER_PLAN",
+      "8": "REPOSSESSION_OR_FORECLOSURE",
+      "9": "CHARGE_OFF_OR_COLLECTION",
+      "G": "COLLECTION",
+      "V": "VOLUNTARY_SURRENDER",
+      "F": "FORECLOSURE_PROCEEDINGS",
+      "CLS": "CLOSED_STATUS"
+    },
+    "ECOA_RESPONSIBILITY": {
+      "1": "INDIVIDUAL",
+      "I": "INDIVIDUAL",
+      "2": "JOINT",
+      "J": "JOINT",
+      "3": "AUTHORIZED_USER",
+      "A": "AUTHORIZED_USER",
+      "5": "CO_MAKER_GUARANTOR",
+      "C": "CO_MAKER_GUARANTOR",
+      "7": "MAKER_PRIMARY",
+      "M": "MAKER_PRIMARY",
+      "T": "TERMINATED",
+      "X": "DECEASED",
+      "W": "BUSINESS_COMMERCIAL"
+    },
+    "ACCOUNT_TYPE_ALPHA": {
+      "R": "REVOLVING",
+      "I": "INSTALLMENT",
+      "M": "MORTGAGE",
+      "O": "OPEN"
+    },
+    "DATE_SUFFIX_INDICATORS": {
+      "R": "REPORTED_INDICATOR",
+      "A": "AUTOMATED_INDICATOR"
+    }
+  },
+  "validation_hints": {
+    "notes": [
+      "Experian consumer PDFs typically do NOT append date suffixes; if suffix is present, treat as tri-merge display artifact.",
+      "If a grid cell contains unknown symbol, normalize as UNKNOWN_CODE and require evidence-bound handling."
+    ],
+    "unknown_code_policy": {
+      "on_unknown_grid_code": "UNKNOWN_CODE",
+      "on_unknown_ecoa_code": "UNKNOWN_CODE",
+      "on_unknown_account_type": "UNKNOWN_CODE"
     }
   }
 }
