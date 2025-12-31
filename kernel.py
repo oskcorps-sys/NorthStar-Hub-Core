@@ -1,9 +1,11 @@
+# kernel.py
 """
-NorthStar Hub — Kernel Core (NS-DK-1.0)
-Scope: Technical data consistency check only
+NorthStar Hub — Kernel Core (NS-DK-1.0) — V2.1
+Scope: TECHNICAL_DATA_CONSISTENCY_CHECK_ONLY
 - Evidence-bound JSON output
 - Fail-closed behavior
-- Bureau-aware normalization via BTM (pre-kernel interpretation)
+- Confidence Gate
+- Optional BTM (Bureau Translation Map) support
 """
 
 from __future__ import annotations
@@ -11,16 +13,14 @@ from __future__ import annotations
 import os
 import json
 import time
-import datetime as dt
 import inspect
-from typing import Any, Dict, List
+import datetime as dt
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 from google import genai
 from google.genai import types
 
-from manifest_manager import ManifestManager
-from bureau_detector import detect_bureau
-from btm_runtime import load_btm, btm_to_instruction
 
 # -----------------------------
 # CANON (DO NOT DRIFT)
@@ -30,27 +30,36 @@ NOTES_IMMUTABLE = "TECHNICAL_DATA_CONSISTENCY_CHECK_ONLY"
 
 ALLOWED_STATUS = {"OK", "RISK_DETECTED", "INCOMPLETE", "UNKNOWN", "SCOPE_LIMITATION"}
 ALLOWED_RISK = {"NONE", "LOW", "MEDIUM", "HIGH"}
+
 CONFIDENCE_GATE = 0.70
 
 # -----------------------------
-# PATHS (Repo-local for Alpha)
+# PATHS (Repo-local Alpha)
 # -----------------------------
-SOUL_DIR = "00_NORTHSTAR_SOUL_IMPUT"
-MANIFEST_PATH = "manifests/soul_manifest.json"
+SOUL_DIR = "00_NORTHSTAR_SOUL_IMPUT"          # (tu nombre actual)
+BTM_DIR = os.path.join(SOUL_DIR, "BTM")       # recomendado: 00_NORTHSTAR_SOUL_IMPUT/BTM/
 TMP_DIR = "tmp"
+
+MANIFEST_PATH = "manifests/soul_manifest.json"
 
 # -----------------------------
 # GEMINI
 # -----------------------------
-# Usa el modelo que ya confirmaste (2.5 flash)
-MODEL_ID = os.getenv("NS_GEMINI_MODEL", "gemini-2.5-flash")
+# Si ya estás usando 2.5 flash, déjalo así. Si no, cámbialo desde env MODEL_ID.
+MODEL_ID = os.getenv("MODEL_ID", "gemini-2.5-flash")
 GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
 
 
+# -----------------------------
+# TIME
+# -----------------------------
 def _utc_iso() -> str:
     return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 
+# -----------------------------
+# PAYLOAD HELPERS
+# -----------------------------
 def _empty_payload(
     status: str = "INCOMPLETE",
     risk_level: str = "NONE",
@@ -69,41 +78,31 @@ def _empty_payload(
     }
 
 
-def _validate_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+def _normalize_contract(raw: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Enforces NS-DK-1.0 contract and fail-closed behavior.
-    Hard gate: confidence < 0.70 => UNKNOWN (no conclusions).
+    Ensures NS-DK-1.0 keys exist and are well-typed.
+    IMPORTANT: timestamp/version/notes get hard-overridden later.
     """
     try:
-        payload = dict(payload or {})
-        payload["version"] = KERNEL_VERSION
-        payload["timestamp"] = payload.get("timestamp") or _utc_iso()
+        payload = dict(raw or {})
 
+        # status / risk
         if payload.get("status") not in ALLOWED_STATUS:
-            return _empty_payload(status="UNKNOWN", risk_level="NONE", confidence=0.0, notes_extra="BAD_STATUS")
-
+            payload["status"] = "UNKNOWN"
         if payload.get("risk_level") not in ALLOWED_RISK:
-            return _empty_payload(status="UNKNOWN", risk_level="NONE", confidence=0.0, notes_extra="BAD_RISK_LEVEL")
+            payload["risk_level"] = "NONE"
 
+        # findings
         if not isinstance(payload.get("findings"), list):
             payload["findings"] = []
 
-        conf = payload.get("confidence")
+        # confidence
+        conf = payload.get("confidence", 0.0)
         payload["confidence"] = float(conf) if isinstance(conf, (int, float)) else 0.0
 
-        if payload["confidence"] < CONFIDENCE_GATE:
-            return _empty_payload(
-                status="UNKNOWN",
-                risk_level="NONE",
-                confidence=payload["confidence"],
-                notes_extra="CONFIDENCE_GATE_ACTIVE"
-            )
-
-        payload["notes"] = NOTES_IMMUTABLE
         return payload
-
     except Exception:
-        return _empty_payload(status="UNKNOWN", risk_level="NONE", confidence=0.0, notes_extra="VALIDATION_EXCEPTION")
+        return _empty_payload(status="UNKNOWN", notes_extra="NORMALIZE_EXCEPTION")
 
 
 def _evidence_gate(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -116,11 +115,11 @@ def _evidence_gate(payload: Dict[str, Any]) -> Dict[str, Any]:
         payload["findings"] = []
         return payload
 
-    valid = []
+    valid: List[Dict[str, Any]] = []
     for f in findings:
         if not isinstance(f, dict):
             continue
-        ev = f.get("evidence") or {}
+        ev = f.get("evidence")
         if not isinstance(ev, dict):
             continue
 
@@ -128,6 +127,7 @@ def _evidence_gate(payload: Dict[str, Any]) -> Dict[str, Any]:
         page = ev.get("page")
         field = ev.get("field")
 
+        # Require all three, not placeholders
         if doc and page and field:
             if str(page).strip().upper() != "UNKNOWN" and str(field).strip().upper() != "UNKNOWN":
                 valid.append(f)
@@ -142,8 +142,22 @@ def _evidence_gate(payload: Dict[str, Any]) -> Dict[str, Any]:
     return payload
 
 
+def _finalize(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    HARD OVERRIDES:
+    - version must be canonical
+    - timestamp must be runtime UTC
+    - notes must remain immutable
+    """
+    payload = dict(payload or {})
+    payload["version"] = KERNEL_VERSION
+    payload["timestamp"] = _utc_iso()
+    payload["notes"] = NOTES_IMMUTABLE
+    return payload
+
+
 # -----------------------------
-# SDK-SAFE HELPERS (NO MORE TYPEERRORS)
+# CLIENT
 # -----------------------------
 def _client() -> genai.Client:
     api_key = os.getenv(GEMINI_API_KEY_ENV)
@@ -152,66 +166,196 @@ def _client() -> genai.Client:
     return genai.Client(api_key=api_key)
 
 
-def _upload_any(client: genai.Client, file_path: str):
+# -----------------------------
+# ROBUST UPLOAD (SDK-SIGNATURE SAFE)
+# -----------------------------
+def _wait_active(client: genai.Client, f: Any, sleep_s: int = 2) -> Any:
+    while getattr(getattr(f, "state", None), "name", "") == "PROCESSING":
+        time.sleep(sleep_s)
+        f = client.files.get(name=f.name)
+    return f
+
+
+def upload_any(client: genai.Client, file_path: str) -> Any:
     """
     Upload robusto: se adapta a la firma real del SDK instalado.
-    Evita TypeError de 'path' vs 'file' vs posicional.
+    Evita: TypeError: unexpected keyword argument 'path' / 'file'
     """
     fn = client.files.upload
-
-    def _wait(f, sleep_s=2):
-        while getattr(f.state, "name", "") == "PROCESSING":
-            time.sleep(sleep_s)
-            f = client.files.get(name=f.name)
-        return f
-
     try:
         sig = inspect.signature(fn)
         params = list(sig.parameters.keys())
     except Exception:
         params = []
 
+    # Prefer keyword "path"
     if "path" in params:
         f = fn(path=file_path)
-        return _wait(f)
+        return _wait_active(client, f)
 
+    # Prefer keyword "file"
     if "file" in params:
         try:
             f = fn(file=file_path)
-            return _wait(f)
+            return _wait_active(client, f)
         except TypeError:
             pass
         with open(file_path, "rb") as fh:
             f = fn(file=fh)
-            return _wait(f)
+            return _wait_active(client, f)
 
+    # Fallback positional
     try:
         f = fn(file_path)
-        return _wait(f)
+        return _wait_active(client, f)
     except TypeError:
         with open(file_path, "rb") as fh:
             f = fn(fh)
-            return _wait(f)
+            return _wait_active(client, f)
 
 
-def _part_text(text: str):
+# -----------------------------
+# MANIFEST MANAGER (INLINE, NO EXTRA FILE REQUIRED)
+# -----------------------------
+class ManifestManager:
     """
-    Part.from_text cambia de firma según versiones.
-    Esta función lo hace compatible.
+    Local manifest:
+      fingerprint -> {name, uri, uploaded_at, local}
+
+    Re-upload when:
+      - local file changed (size/mtime)
+      - remote missing/not ACTIVE
+    """
+
+    def __init__(self, manifest_path: str, client: genai.Client):
+        self.path = Path(manifest_path)
+        self.client = client
+        self.data: Dict[str, Dict[str, Any]] = self._load()
+
+    def _load(self) -> Dict[str, Dict[str, Any]]:
+        if self.path.exists():
+            try:
+                return json.loads(self.path.read_text(encoding="utf-8"))
+            except Exception:
+                return {}
+        return {}
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(self.data, indent=2), encoding="utf-8")
+
+    def _fingerprint(self, p: Path) -> str:
+        st = p.stat()
+        return f"{p.name}__{st.st_size}__{int(st.st_mtime)}"
+
+    def _remote_active(self, remote_name: str) -> bool:
+        try:
+            f = self.client.files.get(name=remote_name)
+            return getattr(getattr(f, "state", None), "name", "") == "ACTIVE"
+        except Exception:
+            return False
+
+    def ensure_active_pdf_files(self, folder_path: str) -> List[Dict[str, str]]:
+        folder = Path(folder_path)
+        if not folder.exists():
+            raise FileNotFoundError(f"SOUL folder missing: {folder_path}")
+
+        refs: List[Dict[str, str]] = []
+
+        for p in sorted(folder.glob("*.pdf")):
+            if not p.is_file():
+                continue
+
+            key = self._fingerprint(p)
+            entry = self.data.get(key)
+
+            # reuse if remote ACTIVE
+            if entry and entry.get("name") and self._remote_active(entry["name"]):
+                refs.append({"name": entry["name"], "uri": entry["uri"], "local": p.name})
+                continue
+
+            uploaded = upload_any(self.client, str(p))
+            self.data[key] = {
+                "name": uploaded.name,
+                "uri": uploaded.uri,
+                "uploaded_at": int(time.time()),
+                "local": p.name,
+            }
+            refs.append({"name": uploaded.name, "uri": uploaded.uri, "local": p.name})
+
+        self.save()
+        return refs
+
+
+# -----------------------------
+# BUREAU DETECTOR + BTM LOADER
+# -----------------------------
+def _detect_bureau_from_pdf_text(report_path: str) -> str:
+    """
+    Quick, local detector (no AI) using PyPDF2 if installed.
+    Returns: TRANSUNION | EXPERIAN | EQUIFAX | UNKNOWN
     """
     try:
-        return types.Part.from_text(text=text)
-    except TypeError:
-        return types.Part.from_text(text)
+        from PyPDF2 import PdfReader  # type: ignore
+        reader = PdfReader(report_path)
+        if not reader.pages:
+            return "UNKNOWN"
+        text = (reader.pages[0].extract_text() or "").upper()
+        if "TRANSUNION" in text:
+            return "TRANSUNION"
+        if "EXPERIAN" in text:
+            return "EXPERIAN"
+        if "EQUIFAX" in text:
+            return "EQUIFAX"
+        return "UNKNOWN"
+    except Exception:
+        return "UNKNOWN"
+
+
+def _load_btm(bureau_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Looks for BTM JSON files.
+    Recommended filenames:
+      - BTM_TRANSUNION.json
+      - BTM_EXPERIAN.json
+      - BTM_EQUIFAX.json
+    Location:
+      00_NORTHSTAR_SOUL_IMPUT/BTM/
+    """
+    try:
+        if bureau_id not in ("TRANSUNION", "EXPERIAN", "EQUIFAX"):
+            return None
+        btm_path = os.path.join(BTM_DIR, f"BTM_{bureau_id}.json")
+        if not os.path.exists(btm_path):
+            return None
+        with open(btm_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
 
 
 # -----------------------------
 # SYSTEM INSTRUCTION (STRICT)
 # -----------------------------
-SYSTEM_INSTRUCTION = f"""
+def _system_instruction(bureau_id: str, btm: Optional[Dict[str, Any]]) -> str:
+    btm_clause = ""
+    if btm:
+        # Keep it short; pass the map as JSON inline, but do not let it balloon.
+        btm_json = json.dumps(btm, ensure_ascii=False)
+        btm_clause = f"""
+BUREAU_TRANSLATION_MAP (BTM):
+- Bureau detected: {bureau_id}
+- Use this BTM to interpret bureau-native/proprietary codes before comparing to Metro 2.
+- If a code is bureau-native and has a valid mapping in BTM, DO NOT flag it as inconsistency.
+- Only flag CODE_MAPPING_INCONSISTENCY if a bureau-native code has NO valid translation or violates the mapping.
+BTM_JSON:
+{btm_json}
+""".strip()
+
+    return f"""
 ROLE: Principal Technical Data Consistency Auditor (NorthStar Hub).
 SCOPE: {NOTES_IMMUTABLE}. Not legal advice. Not financial advice. Not credit repair.
-MISSION: Detect technical inconsistencies and mismatches between a credit report and provided standards (SOUL docs).
+MISSION: Detect technical inconsistencies/mismatches between the credit report and provided standards (SOUL PDFs).
 
 HARD RULES:
 1) OUTPUT ONLY valid JSON following NS-DK-1.0 contract. No extra text.
@@ -220,8 +364,8 @@ HARD RULES:
 4) If evidence is missing/ambiguous, do NOT output the finding.
 5) If report text is unreadable/scan/OCR weak => status INCOMPLETE.
 6) User narrative is NOT evidence. Only the PDFs.
-7) Bureau-native display codes may differ. If BTM is provided, use it for translation BEFORE judging inconsistencies.
-   Do NOT flag format/codes as issues if BTM provides a valid translation.
+
+{btm_clause}
 
 NS-DK-1.0 JSON CONTRACT:
 {{
@@ -247,61 +391,84 @@ OUTPUT REQUIREMENTS:
 """.strip()
 
 
+# -----------------------------
+# CORE RUN
+# -----------------------------
 def _run_gemini_audit(report_path: str) -> Dict[str, Any]:
     client = _client()
 
-    # 1) SOUL
+    # 1) Bureau detect + BTM load
+    bureau_id = _detect_bureau_from_pdf_text(report_path)
+    btm = _load_btm(bureau_id)
+
+    # 2) Ensure SOUL PDFs are active (exclude BTM folder if you keep BTM as JSON)
+    # Only upload PDFs that are in SOUL_DIR root (manuals/standards).
     mm = ManifestManager(MANIFEST_PATH, client)
     soul_refs = mm.ensure_active_pdf_files(SOUL_DIR)
-    if not soul_refs:
-        return _empty_payload(status="INCOMPLETE", notes_extra="SOUL_EMPTY_OR_MISSING_PDFS")
 
-    # 2) Bureau detect + BTM
-    bureau = detect_bureau(report_path)
-    btm = load_btm(SOUL_DIR, bureau)
-    btm_text = btm_to_instruction(btm)
+    if not soul_refs:
+        return _empty_payload(status="INCOMPLETE", notes_extra="SOUL_NO_PDFS_FOUND")
 
     # 3) Upload report
-    report_file = _upload_any(client, report_path)
+    report_file = upload_any(client, report_path)
 
-    # 4) Build evidence parts: SOUL PDFs + BTM text + report PDF + task text
-    parts: List[Any] = []
+    # 4) Build parts: SOUL PDFs first, report last, then instruction
+    parts: List[types.Part] = []
 
-    # SOUL first
     for ref in soul_refs:
         parts.append(types.Part.from_uri(file_uri=ref["uri"], mime_type="application/pdf"))
 
-    # BTM (text) — ultra corto, solo reglas de traducción
-    parts.append(_part_text(btm_text))
-
-    # Report
     parts.append(types.Part.from_uri(file_uri=report_file.uri, mime_type="application/pdf"))
 
-    # Task (text)
-    parts.append(_part_text(
-        f"Detected bureau: {bureau}. Perform a technical consistency audit of the attached credit report against SOUL standards. "
-        f"Use BTM translations if present. Return ONLY NS-DK-1.0 JSON."
-    ))
+    parts.append(
+        types.Part.from_text(
+            text="Perform a technical consistency audit. Return ONLY NS-DK-1.0 JSON."
+        )
+    )
 
+    sys_inst = _system_instruction(bureau_id=bureau_id, btm=btm)
+
+    # 5) Model call
     try:
         resp = client.models.generate_content(
             model=MODEL_ID,
             contents=[types.Content(role="user", parts=parts)],
             config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_INSTRUCTION,
+                system_instruction=sys_inst,
                 temperature=0.0,
                 response_mime_type="application/json",
             ),
         )
-        raw = json.loads(resp.text)
-        raw = _evidence_gate(raw)
-        return _validate_payload(raw)
-    except json.JSONDecodeError:
-        return _empty_payload(status="UNKNOWN", notes_extra="BAD_JSON_OUTPUT")
     except Exception as e:
+        # Common: 404 model, 429 rate limit, 400 invalid arg, etc.
         return _empty_payload(status="UNKNOWN", notes_extra=f"MODEL_CALL_FAIL:{type(e).__name__}")
 
+    # 6) Parse JSON
+    try:
+        raw = json.loads(resp.text)
+    except Exception:
+        return _empty_payload(status="UNKNOWN", notes_extra="BAD_JSON_OUTPUT")
 
+    payload = _normalize_contract(raw)
+    payload = _evidence_gate(payload)
+
+    # 7) Confidence Gate (fail-closed)
+    if float(payload.get("confidence", 0.0)) < CONFIDENCE_GATE:
+        payload = _empty_payload(
+            status="UNKNOWN",
+            risk_level="NONE",
+            confidence=float(payload.get("confidence", 0.0) or 0.0),
+            notes_extra="CONFIDENCE_GATE_ACTIVE",
+        )
+
+    # 8) HARD OVERRIDES (kill fake timestamps forever)
+    payload = _finalize(payload)
+    return payload
+
+
+# -----------------------------
+# PUBLIC API (CALLED BY UI)
+# -----------------------------
 def audit_credit_report(file_path: str) -> Dict[str, Any]:
     """
     Canonical entry point called by Streamlit (main.py)
@@ -317,11 +484,6 @@ def audit_credit_report(file_path: str) -> Dict[str, Any]:
             return _empty_payload(status="INCOMPLETE", notes_extra="NOT_PDF")
 
         os.makedirs(TMP_DIR, exist_ok=True)
-
-        # SOUL dir must exist in repo
-        if not os.path.isdir(SOUL_DIR):
-            return _empty_payload(status="INCOMPLETE", notes_extra="SOUL_DIR_MISSING")
-
         return _run_gemini_audit(file_path)
 
     except Exception as e:
