@@ -1,4 +1,6 @@
+# main.py
 import os
+import uuid
 import streamlit as st
 
 from kernel import audit_credit_report, KERNEL_VERSION, NOTES_IMMUTABLE
@@ -9,10 +11,6 @@ st.set_page_config(
     layout="wide",
 )
 
-# Streamlit Cloud: map secrets -> env var (kernel reads env)
-if "GEMINI_API_KEY" in st.secrets and not os.getenv("GEMINI_API_KEY"):
-    os.environ["GEMINI_API_KEY"] = st.secrets["GEMINI_API_KEY"]
-
 st.title("⚖️ NorthStar Hub (Alpha)")
 st.caption(f"Kernel: {KERNEL_VERSION} | Mode: {NOTES_IMMUTABLE}")
 st.divider()
@@ -21,19 +19,34 @@ col1, col2 = st.columns([1, 2], gap="large")
 
 with col1:
     st.subheader("📂 Ingest Evidence")
+
+    if st.button("🧹 Clear results", use_container_width=True):
+        st.session_state.pop("audit_result", None)
+        st.session_state.pop("last_file", None)
+        st.rerun()
+
     uploaded = st.file_uploader("Upload Credit Report (PDF)", type=["pdf"])
 
     if uploaded:
         st.success("PDF received. Ready to run audit.")
         if st.button("🚀 Run Forensic Audit", use_container_width=True):
             os.makedirs("tmp", exist_ok=True)
-            tmp_path = os.path.join("tmp", uploaded.name)
+
+            # Avoid collisions
+            safe_name = f"{uuid.uuid4().hex}_{uploaded.name}"
+            tmp_path = os.path.join("tmp", safe_name)
 
             with open(tmp_path, "wb") as f:
                 f.write(uploaded.getbuffer())
 
             with st.spinner("Running technical consistency audit..."):
                 result = audit_credit_report(tmp_path)
+
+            # Optional cleanup: remove uploaded file after processing
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
 
             st.session_state["audit_result"] = result
             st.session_state["last_file"] = uploaded.name
