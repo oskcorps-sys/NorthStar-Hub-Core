@@ -1,12 +1,188 @@
 {
   "bureau": "TRANSUNION",
-  "version": "1.0",
-  "description": "Translation map from TransUnion proprietary codes to Metro 2 standard",
-  "mappings": {
+  "version": "1.1",
+  "description": "BTM — Bureau Translation Manifest (TransUnion). Normalizes TransUnion-native representations to Metro 2-friendly semantics BEFORE audit. This does not 'repair' data; it translates formats/codes so the auditor does not flag bureau-native conventions as inconsistencies.",
+  "source_notes": {
+    "scope": "Technical normalization only",
+    "fail_closed": true,
+    "last_updated": "2025-12-31"
+  },
+  "normalization_rules": {
     "MOP": {
-      "01": "11",
-      "02": "12",
-      "05": "13"
+      "strip_prefix_letters": true,
+      "strip_suffix_letters": true,
+      "accept_composites": true,
+      "examples": [
+        "R01 -> 01 (Account Type 'R' removed)",
+        "09P -> 09 (suffix descriptor removed)",
+        "1 -> 01 (left-pad to 2 digits)"
+      ]
+    },
+    "DATES": {
+      "allow_suffix_R": true,
+      "suffix_R_meaning": "Reported",
+      "rule": "If date is formatted like MM/YYR, remove 'R' suffix for standard comparison (keep original as evidence)."
+    },
+    "AMOUNTS": {
+      "allow_currency_format_in_count_fields": true,
+      "rule": "If a non-monetary/count field is rendered like '$000000000.00', normalize to numeric 0 for consistency checks, but keep original formatting as evidence."
     }
+  },
+  "mappings": {
+    "PAYMENT_HISTORY_RATINGS": {
+      "OK": {
+        "meaning": "Current / pays or paid as agreed",
+        "metro2_equivalent": "11"
+      },
+      "N/R": {
+        "meaning": "Not Reported",
+        "metro2_equivalent": "NR"
+      },
+      "X": {
+        "meaning": "Unknown",
+        "metro2_equivalent": "UN"
+      },
+      "30": {
+        "meaning": "30 days late",
+        "metro2_equivalent": "71"
+      },
+      "60": {
+        "meaning": "60 days late",
+        "metro2_equivalent": "78"
+      },
+      "90": {
+        "meaning": "90 days late",
+        "metro2_equivalent": "80"
+      },
+      "120": {
+        "meaning": "120+ days late",
+        "metro2_equivalent": "82"
+      },
+      "COL": {
+        "meaning": "Transferred/placed in collection",
+        "metro2_equivalent": "93"
+      },
+      "VS": {
+        "meaning": "Voluntary surrender",
+        "metro2_equivalent": "95"
+      },
+      "RPO": {
+        "meaning": "Repossession",
+        "metro2_equivalent": "96"
+      },
+      "C/O": {
+        "meaning": "Charged off",
+        "metro2_equivalent": "97"
+      },
+      "FC": {
+        "meaning": "Foreclosure",
+        "metro2_equivalent": "94"
+      }
+    },
+    "ECOA_RESPONSIBILITY": {
+      "I": {
+        "meaning": "Individual",
+        "metro2_equivalent": "1"
+      },
+      "C": {
+        "meaning": "Joint contractual liability",
+        "metro2_equivalent": "2"
+      },
+      "A": {
+        "meaning": "Authorized user / associated (bureau-native usage)",
+        "metro2_equivalent": "5"
+      },
+      "P": {
+        "meaning": "Co-maker / participant (bureau-native usage)",
+        "metro2_equivalent": "3"
+      },
+      "U": {
+        "meaning": "Undesignated / unknown responsibility",
+        "metro2_equivalent": "0"
+      },
+      "X": {
+        "meaning": "Unknown",
+        "metro2_equivalent": "0"
+      },
+      "B": {
+        "meaning": "NOT ECOA. Kind of Business Classification (Banks & S&L). Must not be validated as ECOA.",
+        "metro2_equivalent": "N/A"
+      }
+    },
+    "MOP": {
+      "01": {
+        "meaning": "Pays as agreed",
+        "metro2_equivalent": "11"
+      },
+      "02": {
+        "meaning": "Not more than two payments past due",
+        "metro2_equivalent": "12"
+      },
+      "03": {
+        "meaning": "Not more than three payments past due",
+        "metro2_equivalent": "13"
+      },
+      "04": {
+        "meaning": "Not more than four payments past due",
+        "metro2_equivalent": "14"
+      },
+      "05": {
+        "meaning": "Account in repossession",
+        "metro2_equivalent": "95"
+      },
+      "06": {
+        "meaning": "Transferred to collection",
+        "metro2_equivalent": "93"
+      },
+      "07": {
+        "meaning": "Foreclosure",
+        "metro2_equivalent": "94"
+      },
+      "08": {
+        "meaning": "Voluntary surrender",
+        "metro2_equivalent": "95"
+      },
+      "09": {
+        "meaning": "Charged off / written off",
+        "metro2_equivalent": "97"
+      }
+    },
+    "PUBLIC_RECORDS": {
+      "CBL": {
+        "meaning": "Chapter 7 bankruptcy",
+        "metro2_equivalent": "BK7"
+      },
+      "WEP": {
+        "meaning": "Chapter 13 bankruptcy",
+        "metro2_equivalent": "BK13"
+      },
+      "CBR": {
+        "meaning": "Chapter 11 bankruptcy",
+        "metro2_equivalent": "BK11"
+      },
+      "DM": {
+        "meaning": "Bankruptcy dismissed",
+        "metro2_equivalent": "BK_DISMISSED"
+      }
+    },
+    "DATE_SUFFIX": {
+      "R": {
+        "meaning": "Reported",
+        "metro2_equivalent": "NONE",
+        "normalization": "strip_suffix"
+      }
+    }
+  },
+  "guards": {
+    "do_not_flag_as_inconsistency": [
+      "PAYMENT_HISTORY_RATINGS.N/R",
+      "PAYMENT_HISTORY_RATINGS.X",
+      "DATE_SUFFIX.R",
+      "MOP composite forms (e.g., R01, 09P) after normalization"
+    ],
+    "flag_as_inconsistency_only_if": [
+      "A code appears in the report that is not present in this BTM and cannot be normalized to a known base code",
+      "A field is semantically misused (example: using 'B' as ECOA when BTM marks it as NOT ECOA)"
+    ]
   }
 }
