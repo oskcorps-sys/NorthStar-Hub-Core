@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://northstarhub.dev/schemas/a2a_envelope.json",
+  "title": "NorthStar Hub — A2A-lite Envelope v1",
+  "description": "Agent-to-Agent lightweight envelope for deterministic orchestration and auditing",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "envelope_version",
+    "agent",
+    "intent",
+    "context",
+    "payload",
+    "constraints",
+    "trace"
+  ],
+  "properties": {
+    "envelope_version": {
+      "type": "string",
+      "const": "A2A-LITE-1.0"
+    },
+    "agent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "role", "capabilities"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Stable agent identifier (e.g., NS_KERNEL, BUREAU_DETECTOR)"
+        },
+        "role": {
+          "type": "string",
+          "description": "High-level responsibility of the agent"
+        },
+        "capabilities": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "intent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["primary", "secondary"],
+      "properties": {
+        "primary": {
+          "type": "string",
+          "description": "Primary task (e.g., TECHNICAL_AUDIT)"
+        },
+        "secondary": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bureau", "documents"],
+      "properties": {
+        "bureau": {
+          "type": "string",
+          "enum": ["EXPERIAN", "EQUIFAX", "TRANSUNION", "UNKNOWN"]
+        },
+        "documents": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "type"],
+            "properties": {
+              "name": { "type": "string" },
+              "type": {
+                "type": "string",
+                "enum": ["CREDIT_REPORT", "SOUL_STANDARD", "BTM_MAPPING"]
+              }
+            }
+          }
+        }
+      }
+    },
+    "payload": {
+      "type": "object",
+      "description": "Agent-specific input payload (opaque to the envelope)"
+    },
+    "constraints": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fail_closed", "confidence_gate", "no_prescription"],
+      "properties": {
+        "fail_closed": { "type": "boolean", "const": true },
+        "confidence_gate": {
+          "type": "number",
+          "minimum": 0.0,
+          "maximum": 1.0
+        },
+        "no_prescription": { "type": "boolean", "const": true }
+      }
+    },
+    "trace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["request_id", "timestamp"],
+      "properties": {
+        "request_id": {
+          "type": "string",
+          "description": "UUID or deterministic hash"
+        },
+        "timestamp": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+        }
+      }
+    }
+  }
+}
